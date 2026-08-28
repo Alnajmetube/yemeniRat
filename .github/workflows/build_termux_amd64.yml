@@ -20,24 +20,34 @@ jobs:
 
       - name: Build Standalone Binary inside Termux Environment
         run: |
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace termux/termux-docker:aarch64 bash -c "
-            chmod -R 777 /workspace
-            mkdir -p build
+          # تجهيز مجلد المخرجات على المستضيف
+          mkdir -p build
+          sudo chmod -R 777 build
+
+          docker run --rm -v ${{ github.workspace }}:/workspace termux/termux-docker:aarch64 bash -c "
             pkg update -y && pkg upgrade -y
             pkg install python clang build-essential patchelf zstd ccache termux-elf-cleaner -y
-            pip install --upgrade pip
-            pip install -r client_requirements.txt
+
+            pip install -r /workspace/client_requirements.txt
             pip install nuitka
+
+            # النسخ إلى مجلد مؤقت داخل الحاوية للعمل بحرية وبدون أخطاء صلاحيات
+            mkdir -p /tmp/work
+            cp -r /workspace/* /tmp/work/
+            cd /tmp/work
 
             nuitka --standalone \
                    --onefile \
                    --lto=yes \
                    --remove-output \
-                   --output-dir=build \
+                   --output-dir=build_out \
                    --output-filename=termux_client_arm64 \
                    client.py
 
-            strip build/termux_client_arm64
+            strip build_out/termux_client_arm64
+
+            # نقل الملف التنفيذي النهائي إلى المجلد الخارجي
+            cp build_out/termux_client_arm64 /workspace/build/
           "
 
       - name: Upload binary artifact
