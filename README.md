@@ -126,6 +126,11 @@ http://127.0.0.1:8089/docs
 ستظهر واجهة Swagger API.
 
 ---
+aarch64 → استخدم arm64
+
+armv7l → استخدم worker_armv7
+
+x86_64 → استخدم worker_x86_64
 
 ## 🖥️ تثبيت العميل (Worker Client)
 

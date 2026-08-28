@@ -1,0 +1,51 @@
+name: Build ARMv7 Binary (Nuitka)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:   # تتيح التشغيل اليدوي
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: سحب الكود من المستودع
+        uses: actions/checkout@v4
+
+      - name: إعداد QEMU لمحاكاة ARMv7
+        uses: docker/setup-qemu-action@v3
+
+      - name: بناء الملف الثنائي (standalone) باستخدام Nuitka داخل حاوية ARMv7
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v $PWD:/workspace \
+            -w /workspace \
+            python:3.10-slim \
+            bash -c "
+              set -e
+              echo 'تحديث الحزم وتثبيت أدوات الترجمة...'
+              apt-get update && apt-get install -y --no-install-recommends gcc g++ make
+              echo 'تثبيت pip والمكتبات المطلوبة...'
+              pip install --upgrade pip
+              pip install -r client_requirements.txt
+              pip install nuitka
+              echo 'بدء البناء باستخدام Nuitka...'
+              python -m nuitka \
+                --standalone \
+                --onefile \
+                --enable-plugin=requests \
+                --enable-plugin=urllib3 \
+                --output-dir=build \
+                --output-filename=worker-armv7l \
+                client.py
+            "
+
+      - name: رفع الملف الثنائي الناتج كـ Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-armv7l
+          path: build/worker-armv7l
+          if-no-files-found: error

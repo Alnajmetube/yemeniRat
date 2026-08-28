@@ -1,0 +1,42 @@
+name: Build ARM64 standalone binary
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm  # ARM64 runner provided by GitHub
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential patchelf python3-dev
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r client_requirements.txt
+          pip install nuitka
+
+      - name: Build standalone binary with Nuitka
+        run: |
+          nuitka --standalone --onefile --output-dir=build --output-filename=client client.py
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-arm64
+          path: build/client
