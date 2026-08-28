@@ -1,4 +1,4 @@
-name: Build ARMv7 Binary (Nuitka)
+name: Build Termux ARMv7 Standalone Binary
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-armv7:
+  build-termux-armv7:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,29 +18,27 @@ jobs:
       - name: إعداد QEMU لمحاكاة ARMv7
         uses: docker/setup-qemu-action@v3
 
-      - name: بناء الملف الثنائي داخل حاوية Linux ARMv7
+      - name: بناء الملف الثنائي داخل حاوية Termux ARMv7
         run: |
           docker run --rm \
             --platform linux/arm/v7 \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
-            python:3.10-slim \
-            bash -c "
+            termux/termux-docker:arm bash -c "
               set -e
-              apt-get update && apt-get install -y --no-install-recommends \
-                gcc g++ make patchelf zstd ccache python3-dev binutils
+              pkg update -y && pkg upgrade -y
+              pkg install python clang build-essential patchelf zstd ccache -y
               pip install --upgrade pip
               pip install -r client_requirements.txt
               pip install nuitka
 
-              python -m nuitka \
-                --standalone \
-                --onefile \
-                --lto=yes \
-                --remove-output \
-                --output-dir=build \
-                --output-filename=worker-armv7l \
-                client.py
+              nuitka --standalone \
+                     --onefile \
+                     --lto=yes \
+                     --remove-output \
+                     --output-dir=build \
+                     --output-filename=worker-armv7l \
+                     client.py
 
               strip build/worker-armv7l
             "
@@ -48,6 +46,6 @@ jobs:
       - name: رفع الملف الناتج
         uses: actions/upload-artifact@v4
         with:
-          name: worker-armv7l
+          name: worker-armv7l-termux
           path: build/worker-armv7l
           if-no-files-found: error

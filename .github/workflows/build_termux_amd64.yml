@@ -22,7 +22,7 @@ jobs:
         run: |
           docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace termux/termux-docker:aarch64 bash -c "
             pkg update -y && pkg upgrade -y
-            pkg install python clang build-essential patchelf zstd ccache -y
+            pkg install python clang build-essential patchelf zstd ccache termux-elf-cleaner -y
             pip install --upgrade pip
             pip install -r client_requirements.txt
             pip install nuitka
