@@ -1,0 +1,45 @@
+name: Build Termux Standalone Binary
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-termux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM64 Emulation
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build Standalone Binary inside Termux Environment
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace termux/termux-docker:aarch64 bash -c "
+            pkg update -y && pkg upgrade -y
+            pkg install python clang build-essential patchelf zstd ccache -y
+            pip install --upgrade pip
+            pip install -r client_requirements.txt
+            pip install nuitka
+
+            nuitka --standalone \
+                   --onefile \
+                   --lto=yes \
+                   --remove-output \
+                   --output-dir=build \
+                   --output-filename=termux_client_amd64 \
+                   client.py
+
+            strip build/termux_client_amd64
+          "
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux_client_amd64
+          path: build/termux_client_amd64
