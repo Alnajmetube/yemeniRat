@@ -5,11 +5,14 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # allow manual trigger
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-20.04, ubuntu-22.04]  # بناء نسختين
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
@@ -18,9 +21,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'  # adjust as needed
+          python-version: '3.10'
 
-      - name: Install system dependencies (for Nuitka)
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential
@@ -37,11 +40,11 @@ jobs:
         run: |
           nuitka --standalone --onefile \
                  --output-dir=build \
-                 --output-filename=worker_x86_64 \
+                 --output-filename=worker_${{ matrix.os }} \
                  client.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: client_x86_64
-          path: build/worker_x86_64
+          name: client_${{ matrix.os }}
+          path: build/worker_${{ matrix.os }}
