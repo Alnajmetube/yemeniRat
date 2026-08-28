@@ -21,6 +21,8 @@ jobs:
       - name: Build Standalone Binary inside Termux Environment
         run: |
           docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace termux/termux-docker:aarch64 bash -c "
+            chmod -R 777 /workspace
+            mkdir -p build
             pkg update -y && pkg upgrade -y
             pkg install python clang build-essential patchelf zstd ccache termux-elf-cleaner -y
             pip install --upgrade pip
@@ -32,14 +34,14 @@ jobs:
                    --lto=yes \
                    --remove-output \
                    --output-dir=build \
-                   --output-filename=termux_client_amd64 \
+                   --output-filename=termux_client_arm64 \
                    client.py
 
-            strip build/termux_client_amd64
+            strip build/termux_client_arm64
           "
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_client_amd64
-          path: build/termux_client_amd64
+          name: termux_client_arm64
+          path: build/termux_client_arm64
