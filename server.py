@@ -1450,7 +1450,7 @@ def interactive_shell(worker):
             continue
 
         # --- Built-in commands ---
-        if command.lower() in ('exit', 'quit'):
+        if command.lower() in ('quit'):
             break
 
         elif command.lower() == 'help':
