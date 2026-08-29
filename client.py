@@ -1,237 +1,367 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Worker Client for centralized task management.
-Runs as a background process on Linux and Termux.
+Worker Manager API Client
+-------------------------
+
+HTTPX helper module for communicating with the Worker Task Manager API.
+
+This module only provides communication utilities.
+Application logic, command execution, scheduling, UI, etc. should be
+implemented by the caller.
+
+Requirements:
+    pip install httpx
 """
 
-import sys
-import os
-import time
-import json
-import logging
+from __future__ import annotations
+
 import argparse
-import subprocess
-import shutil
-import signal
+import json
+import os
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
-import fcntl
+import subprocess
+import sys
+from typing import Any, Dict, Optional
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import httpx
 
-# ============================ Constants ====================================
 HOME = Path(os.environ.get("HOME", str(Path.home())))
-CONFIG_PATH = HOME / ".worker_client.conf"
-LOG_PATH = HOME / ".worker_client.log"
-QUEUE_DIR = HOME / ".worker_client_queue"
-LOCK_FILE = Path("/tmp/worker_client.lock")
-PID_FILE = Path("/tmp/worker_client.pid")
+CONFIG_FILE = HOME / ".worker_config.json"
+QUEUE_DIR = HOME /".worker" / ".worker_client_queue"
 
-DEFAULT_POLL_INTERVAL = 2
-MAX_BACKOFF = 60
-HEALTH_CHECK_INTERVAL = 60
-CANCEL_CHECK_INTERVAL = 2
-MAX_REPORT_LENGTH = 10000  # increased to accommodate longer outputs
+def load_config():
+    """Load configuration from file or return defaults."""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    return {}
 
-_lock_fd = None  # file descriptor holding the lock
+def save_config(url, token):
+    """Save configuration to file."""
+    config = {
+        "url": url,
+        "token": token
+    }
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
 
-
-# ============================ Logging ======================================
-def setup_logging(foreground: bool = False) -> None:
-    """Configure logging to file and optionally to console."""
-    log_format = '%(asctime)s - %(levelname)s - %(message)s'
-    date_format = '%Y-%m-%d %H:%M:%S'
-    handlers = [logging.FileHandler(LOG_PATH)]
-    if foreground:
-        handlers.append(logging.StreamHandler(sys.stdout))
-    logging.basicConfig(
-        level=logging.INFO,
-        format=log_format,
-        datefmt=date_format,
-        handlers=handlers
-    )
+class WorkerAPIError(Exception):
+    """Raised when the Worker Manager API returns an error."""
 
 
-# ============================ Configuration ===============================
-def load_config() -> Dict[str, str]:
-    """Load configuration from ~/.worker_client.conf."""
-    if not CONFIG_PATH.exists():
-        logging.error(f"Config file not found: {CONFIG_PATH}")
-        sys.exit(1)
-    config = {}
-    with open(CONFIG_PATH, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            if '=' in line:
-                key, value = line.split('=', 1)
-                config[key.strip()] = value.strip().strip('"\'')
-    required = ['SERVER_URL', 'TOKEN']
-    for key in required:
-        if key not in config:
-            logging.error(f"Missing required config key: {key}")
-            sys.exit(1)
-    return config
+class WorkerAPI:
+    """
+    Small HTTPX client for the Worker Task Manager API.
 
+    Example:
 
-def write_config(url: str, token: str) -> None:
-    """Write configuration file with secure permissions."""
-    content = f'SERVER_URL="{url}"\nTOKEN="{token}"\n'
-    with open(CONFIG_PATH, 'w') as f:
-        f.write(content)
-    os.chmod(CONFIG_PATH, 0o600)
+        api = WorkerAPI(
+            base_url="http://127.0.0.1:8089",
+            token="YOUR_TOKEN",
+        )
 
+        print(api.health())
+        task = api.current_task()
+    """
 
-# ============================ Lock and PID ================================
-def acquire_lock() -> bool:
-    """Try to acquire an exclusive lock using fcntl.flock."""
-    global _lock_fd
-    try:
-        _lock_fd = open(LOCK_FILE, 'w')
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_fd.write(str(os.getpid()))
-        _lock_fd.flush()
-        return True
-    except (IOError, OSError):
-        return False
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = 30.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
 
+        self.client = httpx.Client(
+            base_url=self.base_url,
+            timeout=self.timeout,
+        )
 
-def release_lock() -> None:
-    """Release the lock (close file descriptor)."""
-    global _lock_fd
-    if _lock_fd:
+    # =========================================================
+    # Internal helpers
+    # =========================================================
+
+    def close(self) -> None:
+        """Close the HTTPX client."""
+        self.client.close()
+
+    def __enter__(self) -> "WorkerAPI":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def _handle_response(
+        self,
+        response: httpx.Response,
+    ) -> dict[str, Any]:
+        """
+        Validate API response and return decoded JSON.
+        """
         try:
-            _lock_fd.close()
-        except Exception:
-            pass
-        _lock_fd = None
+            data = response.json()
+        except ValueError:
+            data = {
+                "success": False,
+                "detail": response.text,
+            }
 
+        if response.is_error:
+            detail = data.get(
+                "detail",
+                response.text or "Unknown API error.",
+            )
+            print(detail)
+            raise WorkerAPIError(
+                f"HTTP {response.status_code}: {detail}"
+            )
 
-def write_pid() -> None:
-    """Write current PID to PID file."""
-    with open(PID_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    os.chmod(PID_FILE, 0o644)
+        return data
 
+    def _get(
+        self,
+        path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        response = self.client.get(
+            path,
+            **kwargs,
+        )
+        return self._handle_response(response)
 
-def remove_pid() -> None:
-    """Remove PID file."""
-    try:
-        PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+    def _post(
+        self,
+        path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        response = self.client.post(
+            path,
+            **kwargs,
+        )
+        return self._handle_response(response)
 
+    # =========================================================
+    # Worker
+    # =========================================================
 
-def read_pid() -> Optional[int]:
-    """Read PID from file, return None if not exists or invalid."""
-    try:
-        with open(PID_FILE, 'r') as f:
-            return int(f.read().strip())
-    except Exception:
-        return None
+    def health(self) -> dict[str, Any]:
+        """
+        Check worker authentication and server connectivity.
 
+        API:
+            GET /worker/health
+        """
+        return self._get(
+            "/worker/health",
+            params={
+                "token": self.token,
+            },
+        )
 
-# ============================ HTTP Client =================================
-def create_session() -> requests.Session:
-    """Create a requests session with retry strategy."""
-    session = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET", "POST"]
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
+    def current_task(self) -> Optional[dict[str, Any]]:
+        """
+        Get the current pending/running task.
 
+        API:
+            GET /worker/current-task
 
-# ============================ API Calls ===================================
-def health_check(session: requests.Session, config: Dict[str, str]) -> bool:
-    """Check server health. Return True if status is 'active' or 'ok'."""
-    url = f"{config['SERVER_URL']}/worker/health"
-    params = {"token": config['TOKEN']}
-    try:
-        resp = session.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            status = data.get("status", "")
-            return status in ("active", "ok")
-        return False
-    except Exception:
-        return False
+        Returns:
+            Task dictionary or None.
+        """
+        data = self._get(
+            "/worker/current-task",
+            params={
+                "token": self.token,
+            },
+        )
 
+        return data.get("task")
 
-def get_current_task(session: requests.Session, config: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    """Fetch current task. Return task dict or None."""
-    url = f"{config['SERVER_URL']}/worker/current-task"
-    params = {"token": config['TOKEN']}
-    try:
-        resp = session.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            task = data.get("task")
-            if task and task.get("status") == "pending":
+    # =========================================================
+    # Task control
+    # =========================================================
+
+    def start_task(
+        self,
+        task_id: int,
+    ) -> dict[str, Any]:
+        """
+        Mark a pending task as running.
+
+        API:
+            POST /worker/start-task
+        """
+        return self._post(
+            "/worker/start-task",
+            json={
+                "token": self.token,
+                "task_id": task_id,
+            },
+        )
+
+    def is_cancelled(
+        self,
+        task_id: int,
+    ) -> bool:
+        """
+        Check whether a task cancellation was requested.
+
+        API:
+            GET /worker/is-cancelled
+        """
+        data = self._get(
+            "/worker/is-cancelled",
+            params={
+                "token": self.token,
+                "task_id": task_id,
+            },
+        )
+
+        return bool(data.get("cancelled", False))
+
+    def report(
+        self,
+        task_id: int,
+        content: str,
+    ) -> dict[str, Any]:
+        """
+        Send a text report for a task.
+
+        The server automatically completes the task after
+        accepting the report.
+
+        API:
+            POST /worker/report
+        """
+        return self._post(
+            "/worker/report",
+            json={
+                "token": self.token,
+                "task_id": task_id,
+                "content": content,
+            },
+        )
+
+    # =========================================================
+    # File upload
+    # =========================================================
+
+    def upload(
+        self,
+        task_id: int,
+        file_path: str | Path,
+    ) -> dict[str, Any]:
+        """
+        Upload a file related to a task.
+
+        API:
+            POST /worker/upload
+        """
+        path = Path(file_path)
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"File not found: {path}"
+            )
+
+        with path.open("rb") as file_obj:
+            response = self.client.post(
+                "/worker/upload",
+                data={
+                    "token": self.token,
+                    "task_id": str(task_id),
+                },
+                files={
+                    "file": (
+                        path.name,
+                        file_obj,
+                        "application/octet-stream",
+                    )
+                },
+            )
+
+        return self._handle_response(response)
+
+    # =========================================================
+    # Convenience
+    # =========================================================
+
+    def wait_for_task(
+        self,
+        task_id: int,
+        interval: float = 1.0,
+        timeout: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Poll the task until it is no longer pending/running.
+
+        This is only a communication helper.
+        It does not execute anything.
+
+        Returns:
+            Final task dictionary.
+
+        Raises:
+            TimeoutError:
+                If timeout is reached.
+        """
+        import time
+
+        started = time.monotonic()
+
+        while True:
+            task = self.current_task()
+
+            if task is None:
+                return None
+
+            if task.get("id") != task_id:
+                time.sleep(interval)
+                continue
+
+            status = task.get("status")
+
+            if status not in {"pending", "running"}:
                 return task
-        return None
-    except Exception:
-        return None
+
+            if timeout is not None:
+                elapsed = time.monotonic() - started
+
+                if elapsed >= timeout:
+                    raise TimeoutError(
+                        f"Task {task_id} did not finish "
+                        f"within {timeout} seconds."
+                    )
+
+            time.sleep(interval)
+
+    # =========================================================
+    # Raw access
+    # =========================================================
+
+    def get(
+        self,
+        path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Generic GET helper for future/custom endpoints.
+        """
+        return self._get(path, **kwargs)
+
+    def post(
+        self,
+        path: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Generic POST helper for future/custom endpoints.
+        """
+        return self._post(path, **kwargs)
 
 
-def start_task(session: requests.Session, config: Dict[str, str], task_id: int) -> bool:
-    """Notify server that task is started. Return True if success."""
-    url = f"{config['SERVER_URL']}/worker/start-task"
-    data = {"token": config['TOKEN'], "task_id": task_id}
-    try:
-        resp = session.post(url, json=data, timeout=10)
-        return resp.status_code == 200 and resp.json().get("status") == "running"
-    except Exception:
-        return False
 
-
-def is_cancelled(session: requests.Session, config: Dict[str, str], task_id: int) -> bool:
-    """Check if task is cancelled. Return True if cancelled."""
-    url = f"{config['SERVER_URL']}/worker/is-cancelled"
-    params = {"token": config['TOKEN'], "task_id": task_id}
-    try:
-        resp = session.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("cancelled", False)
-        return False
-    except Exception:
-        return False
-
-
-def send_report(session: requests.Session, config: Dict[str, str], task_id: int, content: str) -> bool:
-    """Send task report. Return True if success."""
-    url = f"{config['SERVER_URL']}/worker/report"
-    data = {"token": config['TOKEN'], "task_id": task_id, "content": content}
-    try:
-        resp = session.post(url, json=data, timeout=10)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def upload_file(session: requests.Session, config: Dict[str, str], task_id: int, file_path: Path) -> bool:
-    """Upload a file. Return True if success."""
-    url = f"{config['SERVER_URL']}/worker/upload"
-    try:
-        with open(file_path, 'rb') as f:
-            files = {'file': (file_path.name, f)}
-            data = {'token': config['TOKEN'], 'task_id': task_id}
-            resp = session.post(url, data=data, files=files, timeout=30)
-            return resp.status_code == 200
-    except Exception:
-        return False
-
-
-# ============================ Queue Management ============================
 def queue_report(task_id: int, content: str) -> None:
     """Store a failed report to queue."""
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
@@ -240,388 +370,183 @@ def queue_report(task_id: int, content: str) -> None:
         json.dump({"task_id": task_id, "content": content}, f)
 
 
-def queue_upload(task_id: int, file_path: Path) -> None:
-    """Store a failed upload to queue (copy file)."""
-    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-    queue_file = QUEUE_DIR / f"upload_{task_id}.file"
-    shutil.copy2(file_path, queue_file)
-
-
-def process_queue(session: requests.Session, config: Dict[str, str]) -> None:
-    """Attempt to process queued reports and uploads."""
-    if not QUEUE_DIR.exists():
-        return
-    # Process reports
-    for queue_file in QUEUE_DIR.glob("report_*.json"):
-        try:
-            with open(queue_file, 'r') as f:
-                data = json.load(f)
-            task_id = data['task_id']
-            content = data['content']
-            if send_report(session, config, task_id, content):
-                queue_file.unlink()
-                logging.info(f"Queued report for task {task_id} sent.")
-            else:
-                logging.warning(f"Queued report for task {task_id} still failing.")
-        except Exception as e:
-            logging.error(f"Error processing queued report {queue_file}: {e}")
-    # Process uploads
-    for queue_file in QUEUE_DIR.glob("upload_*.file"):
-        try:
-            task_id = int(queue_file.stem.split('_')[1])
-            if upload_file(session, config, task_id, queue_file):
-                queue_file.unlink()
-                logging.info(f"Queued upload for task {task_id} sent.")
-            else:
-                logging.warning(f"Queued upload for task {task_id} still failing.")
-        except Exception as e:
-            logging.error(f"Error processing queued upload {queue_file}: {e}")
-
-
-# ============================ Upload Handler ==============================
-def handle_upload_command(session: requests.Session, config: Dict[str, str],
-                          task_id: int, command: str) -> None:
-    """
-    Handle upload command: upload <file_path>
-    """
-    parts = command.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        error_msg = "Upload command missing file path. Usage: upload <file_path>"
-        logging.error(f"Task {task_id}: {error_msg}")
-        send_report(session, config, task_id, error_msg)
-        return
-
-    file_path_str = parts[1].strip()
-    file_path = Path(file_path_str)
-
-    if not file_path.exists():
-        error_msg = f"File not found: {file_path_str}"
-        logging.error(f"Task {task_id}: {error_msg}")
-        send_report(session, config, task_id, error_msg)
-        return
-
-    if not file_path.is_file():
-        error_msg = f"Not a file: {file_path_str}"
-        logging.error(f"Task {task_id}: {error_msg}")
-        send_report(session, config, task_id, error_msg)
-        return
-
-    logging.info(f"Task {task_id}: Uploading file {file_path.name}")
-
-    if not start_task(session, config, task_id):
-        logging.error(f"Task {task_id}: Failed to start task")
-        return
-
-    success = upload_file(session, config, task_id, file_path)
-    if success:
-        report_content = f"File uploaded successfully: {file_path.name} (Size: {file_path.stat().st_size} bytes)"
-        logging.info(f"Task {task_id}: {report_content}")
-    else:
-        report_content = f"Failed to upload file: {file_path.name}"
-        logging.warning(f"Task {task_id}: {report_content}")
-        queue_upload(task_id, file_path)
-
-    if not send_report(session, config, task_id, report_content):
-        logging.warning(f"Task {task_id}: Report failed, queuing.")
-        queue_report(task_id, report_content)
-
-
-# ============================ Task Execution ==============================
-def execute_task(session: requests.Session, config: Dict[str, str], task: Dict[str, Any]) -> None:
-    """Execute a single task: run command, handle cancellation, report, upload."""
+def execute_task(task: Dict[str, Any], api: WorkerAPI) -> None:
     task_id = task['id']
     command = task['content']
-    logging.info(f"Executing task {task_id}: {command}")
 
-    # Special command: upload
-    if command.strip().lower().startswith('upload'):
+    """if command.strip().lower().startswith('upload'):
         handle_upload_command(session, config, task_id, command)
-        return
+        return"""
+    if task["status"] == "pending":
+        api.start_task(task["id"])
 
-    # Normal shell command
-    if not start_task(session, config, task_id):
-        logging.error(f"Failed to start task {task_id}, aborting.")
-        return
 
-    # Use Popen to allow periodic cancellation checks
     proc = None
+    report_content = ""
+    
     try:
+        # استخدام Popen مع قراءة متوازية للمخرجات
         proc = subprocess.Popen(
             command,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            executable='/bin/bash'  # or /bin/sh, works on Linux/Termux
+            bufsize=1  # خطي
         )
-
-        # Poll for completion while checking cancellation
+        
+        # استخدام خيوط لقراءة المخرجات بشكل متوازي
+        import threading
+        output_lines = []
+        error_lines = []
+        
+        def read_output(pipe, lines_list):
+            for line in iter(pipe.readline, ''):
+                lines_list.append(line)
+        
+        stdout_thread = threading.Thread(target=read_output, args=(proc.stdout, output_lines))
+        stderr_thread = threading.Thread(target=read_output, args=(proc.stderr, error_lines))
+        
+        stdout_thread.start()
+        stderr_thread.start()
+        
+        # التحقق من الإلغاء والانتهاء
+        import time
         while True:
-            try:
-                retcode = proc.poll()
-                if retcode is not None:
-                    break
-                # Check cancellation
-                if is_cancelled(session, config, task_id):
-                    logging.info(f"Task {task_id} cancelled, terminating process.")
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    if proc.poll() is None:
-                        proc.kill()
-                        proc.wait()
-                    report_content = "Task cancelled by server."
-                    send_report(session, config, task_id, report_content)
-                    return
-                time.sleep(CANCEL_CHECK_INTERVAL)
-            except Exception as e:
-                logging.warning(f"Error during cancellation check: {e}")
+            retcode = proc.poll()
+            if retcode is not None:
+                break
+                
+            # فحص الإلغاء
+            if api.is_cancelled(task_id=task["id"]):
+                proc.terminate()
                 time.sleep(1)
+                if proc.poll() is None:
+                    proc.kill()
+                report_content = "Task cancelled by server."
+                api.report(task["id"], report_content)
+                return
+                
+            time.sleep(2)
+        
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        
+        # تجميع المخرجات
+        full_output = ''.join(output_lines)
+        full_error = ''.join(error_lines)
+        
+        # بناء التقرير
+        if full_output or full_error:
+            report_content = full_output
+            if full_error:
+                if report_content:
+                    report_content += "\n--- STDERR ---\n"
+                report_content += full_error
+        else:
+            report_content = "(empty output)"
+        
+        # إضافة رمز الخروج
+        if proc.returncode != 0:
+            report_content += f"\n[Exit code: {proc.returncode}]"
+        
 
-        stdout, stderr = proc.communicate(timeout=5)
-        returncode = proc.returncode
-
-        # Build report - combine both outputs
-        output_parts = []
-        if stdout and stdout.strip():
-            output_parts.append(stdout.strip())
-        if stderr and stderr.strip():
-            output_parts.append(stderr.strip())
-
-        report_content = "\n".join(output_parts) if output_parts else "(empty output)"
-
-        # Truncate if too long
-        if len(report_content) > MAX_REPORT_LENGTH:
-            report_content = report_content[:MAX_REPORT_LENGTH] + "\n... (truncated)"
-
-        logging.info(f"Task {task_id} completed with exit code {returncode}")
-
+    except subprocess.TimeoutExpired:
+        report_content = "Process timeout"
+        if proc:
+            proc.kill()
     except Exception as e:
-        logging.error(f"Task {task_id} execution error: {e}", exc_info=True)
         report_content = f"Execution error: {str(e)}"
     finally:
         if proc and proc.poll() is None:
             proc.kill()
             proc.wait()
 
-    # Send report
-    if not send_report(session, config, task_id, report_content):
-        logging.warning(f"Task {task_id} report failed, queuing.")
-        queue_report(task_id, report_content)
+    # إرسال التقرير
+    if report_content:
+        if len(report_content) > 10000:
+            report_content = report_content[:10000] + "\n... (truncated)"
+        
+        if not api.report(task["id"], report_content):
+            queue_report(task_id, report_content)
 
 
-# ============================ Main Loop ===================================
-def run_forever(config: Dict[str, str]) -> None:
-    """Main infinite loop: health check, get task, execute."""
-    session = create_session()
-    backoff = DEFAULT_POLL_INTERVAL
-    last_health_check = 0
 
+def run_worker_loop(api):
+    """Main worker loop."""
+    print(f"🔄 Worker started with URL: {api.base_url}")
+    print("Press Ctrl+C to stop\n")
+    
     while True:
         try:
-            # Process queue first
-            process_queue(session, config)
-
-            # Health check periodically (do not block on failure)
-            now = time.time()
-            if now - last_health_check >= HEALTH_CHECK_INTERVAL:
-                if health_check(session, config):
-                    logging.debug("Health check OK")
-                else:
-                    logging.warning("Health check failed (server may be down)")
-                last_health_check = now
-
-            # Get current task
-            task = get_current_task(session, config)
+            task = api.current_task()
             if task:
-                backoff = DEFAULT_POLL_INTERVAL  # reset backoff
-                execute_task(session, config, task)
+                print(f"📋 Processing task #{task.get('id')}...")
+                execute_task(task, api)
             else:
-                logging.debug("No pending task, sleeping...")
-                time.sleep(backoff)
-
+                import time
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n🛑 Worker stopped by user.")
+            break
         except Exception as e:
-            logging.error(f"Main loop exception: {e}", exc_info=True)
-            backoff = min(backoff * 2, MAX_BACKOFF)
-            logging.warning(f"Backing off for {backoff} seconds")
-            time.sleep(backoff)
+            print(f"⚠️ Error: {e}")
+            import time
+            time.sleep(3)
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Worker Task Manager Client",
+        epilog="If --install is used, configuration will be saved and script will exit."
+    )
+    
+    parser.add_argument(
+        '--install',
+        action='store_true',
+        help='Install/update configuration and exit'
+    )
+    
+    parser.add_argument(
+        '--url',
+        type=str,
+        help='Worker API URL (e.g., http://127.0.0.1:8089)'
+    )
+    
+    parser.add_argument(
+        '--token',
+        type=str,
+        help='Authentication token'
+    )
+    
+    return parser.parse_args()
 
-# ============================ Install / Uninstall / Stop ==================
-def install(url: str, token: str) -> None:
-    """Install the worker client: create config, add to .bashrc, start daemon."""
-    logging.info(f"Installing with SERVER_URL={url}, TOKEN=...")
-
-    # Create config
-    write_config(url, token)
-    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Add to .bashrc if not already present
-    bashrc = HOME / ".bashrc"
-    script_path = Path(__file__).resolve()
-    # Use a unique marker to avoid duplicates
-    marker = "# WORKER_CLIENT_START"
-    start_line = f'nohup python3 "{script_path}" >/dev/null 2>&1 & {marker}'
-
-    if bashrc.exists():
-        content = bashrc.read_text()
-    else:
-        content = ""
-
-    if marker not in content:
-        with open(bashrc, 'a') as f:
-            f.write(f"\n# Worker client startup\n{start_line}\n")
-        logging.info(f"Added startup line to {bashrc}")
-    else:
-        logging.info("Startup line already in .bashrc")
-
-    # Start the worker in background now
-    logging.info("Starting worker client in background...")
-    os.system(f'nohup python3 "{script_path}" >/dev/null 2>&1 &')
-    logging.info("Installation complete.")
-
-
-def uninstall() -> None:
-    """Uninstall: remove from .bashrc, delete config, stop worker."""
-    logging.info("Uninstalling worker client...")
-
-    # Stop the worker first
-    stop_worker()
-
-    # Remove from .bashrc
-    bashrc = HOME / ".bashrc"
-    if bashrc.exists():
-        marker = "# WORKER_CLIENT_START"
-        lines = bashrc.read_text().splitlines()
-        new_lines = [line for line in lines if marker not in line]
-        bashrc.write_text("\n".join(new_lines))
-        logging.info(f"Removed startup line from {bashrc}")
-
-    # Remove config and queue dir
-    for p in [CONFIG_PATH, QUEUE_DIR]:
-        try:
-            if p.exists():
-                if p.is_dir():
-                    shutil.rmtree(p)
-                else:
-                    p.unlink()
-                logging.info(f"Removed {p}")
-        except Exception as e:
-            logging.warning(f"Could not remove {p}: {e}")
-
-    logging.info("Uninstall complete.")
-
-
-def stop_worker() -> None:
-    """Stop the running worker process."""
-    pid = read_pid()
-    if pid is None:
-        logging.info("No PID file found; worker may not be running.")
-        # Still clean up lock and pid files
-        remove_pid()
-        release_lock()
-        return
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-        # Wait a bit for process to terminate
-        time.sleep(2)
-        # Check if still alive
-        try:
-            os.kill(pid, 0)
-            logging.warning(f"Worker (PID {pid}) did not terminate, sending SIGKILL.")
-            os.kill(pid, signal.SIGKILL)
-            time.sleep(1)
-        except OSError:
-            pass  # process already dead
-        logging.info(f"Worker (PID {pid}) stopped.")
-    except OSError as e:
-        logging.warning(f"Could not kill PID {pid}: {e}")
-
-    # Clean up files
-    remove_pid()
-    release_lock()
-
-
-# ============================ Main Entry ==================================
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Worker Client for task management")
-    parser.add_argument("--install", action="store_true", help="Install worker client")
-    parser.add_argument("--uninstall", action="store_true", help="Uninstall worker client")
-    parser.add_argument("--stop", action="store_true", help="Stop the running worker")
-    parser.add_argument("--foreground", action="store_true", help="Run in foreground (with console logging)")
-    parser.add_argument("--url", help="Server URL (required with --install)")
-    parser.add_argument("--token", help="Authentication token (required with --install)")
-    args = parser.parse_args()
-
-    # Setup logging (will be reconfigured later for foreground)
-    setup_logging(foreground=args.foreground)
-
-    # Handle install
+def main():
+    args = parse_arguments()
+    
+    # Handle installation/update
     if args.install:
         if not args.url or not args.token:
-            logging.error("--install requires --url and --token")
             sys.exit(1)
-        install(args.url, args.token)
-        sys.exit(0)
-
-    # Handle uninstall
-    if args.uninstall:
-        uninstall()
-        sys.exit(0)
-
-    # Handle stop
-    if args.stop:
-        stop_worker()
-        sys.exit(0)
-
-    # Normal execution: load config, acquire lock, run loop
-    # If not foreground, we still log to file only (already set up)
-    if not args.foreground:
-        # Reconfigure logging to remove console handlers (in case we had any)
-        # Actually setup_logging was called with foreground=False if not set,
-        # but we might have called with foreground=True from args, so let's reset.
-        # We'll just ensure that if not foreground, we have no console handler.
-        # We'll reconfigure logging to file only.
-        for handler in logging.root.handlers[:]:
-            if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
-                logging.root.removeHandler(handler)
-        # Add file handler if not present
-        if not any(isinstance(h, logging.FileHandler) for h in logging.root.handlers):
-            logging.root.addHandler(logging.FileHandler(LOG_PATH))
-        logging.root.setLevel(logging.INFO)
-
+        
+        save_config(args.url, args.token)
+    
+    # Load configuration
     config = load_config()
-
-    # Acquire lock – prevent multiple instances
-    if not acquire_lock():
-        logging.error("Another instance is already running. Exiting.")
+    
+    if not config or not config.get('url') or not config.get('token'):
+        print("❌ Error: Configuration not found or incomplete.")
+        print("Please run: python script.py --install --url <URL> --token <TOKEN>")
         sys.exit(1)
-
-    write_pid()
-    logging.info(f"Worker started (PID {os.getpid()})")
-    logging.info(f"Lock acquired, config loaded: SERVER_URL={config['SERVER_URL']}")
-
-    # Set up signal handlers
-    def signal_handler(sig, frame):
-        logging.info(f"Received signal {sig}, shutting down...")
-        remove_pid()
-        release_lock()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    try:
-        run_forever(config)
-    except KeyboardInterrupt:
-        logging.info("Received KeyboardInterrupt, exiting.")
-    except Exception as e:
-        logging.error(f"Unhandled exception: {e}", exc_info=True)
-    finally:
-        remove_pid()
-        release_lock()
-        logging.info("Worker stopped.")
-
+    
+    # Create API client
+    api = WorkerAPI(
+        base_url=config['url'],
+        token=config['token']
+    )
+    
+    # Run the main loop
+    run_worker_loop(api)
 
 if __name__ == "__main__":
     main()

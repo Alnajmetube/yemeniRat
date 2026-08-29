@@ -428,7 +428,6 @@ def get_task_by_id(task_id: int):
 
     return row
 
-
 def start_task(task_id: int, worker_id: str):
     with db_lock:
         conn = get_connection()
@@ -493,7 +492,6 @@ def start_task(task_id: int, worker_id: str):
 
     return True
 
-
 def request_task_cancel(worker_id: str, task_id: int):
     with db_lock:
         conn = get_connection()
@@ -519,34 +517,27 @@ def request_task_cancel(worker_id: str, task_id: int):
             conn.close()
             return False, "Task is already finished."
 
+        # تحديث حالة المهمة إلى cancelled فوراً
         conn.execute(
             """
             UPDATE tasks
-            SET cancel_requested = 1
+            SET
+                status = 'cancelled',
+                cancel_requested = 1,
+                finished_at = ?
             WHERE id = ?
             """,
-            (task_id,),
+            (
+                utc_now(),
+                task_id,
+            ),
         )
-
-        if row["status"] == "pending":
-            conn.execute(
-                """
-                UPDATE tasks
-                SET
-                    status = 'cancelled',
-                    finished_at = ?
-                WHERE id = ?
-                """,
-                (
-                    utc_now(),
-                    task_id,
-                ),
-            )
 
         conn.commit()
         conn.close()
 
-    return True, "Cancellation requested."
+    return True, "Task cancelled."
+
 
 
 def is_task_cancelled(worker_id: str, task_id: int):
@@ -555,9 +546,7 @@ def is_task_cancelled(worker_id: str, task_id: int):
 
         row = conn.execute(
             """
-            SELECT
-                status,
-                cancel_requested
+            SELECT status
             FROM tasks
             WHERE id = ?
               AND worker_id = ?
@@ -573,10 +562,8 @@ def is_task_cancelled(worker_id: str, task_id: int):
     if not row:
         return True
 
-    return bool(
-        row["cancel_requested"]
-        or row["status"] == "cancelled"
-    )
+    # نتحقق فقط من حالة المهمة إذا كانت cancelled
+    return row["status"] == "cancelled"
 
 
 def complete_task(worker_id: str, task_id: int):
@@ -600,29 +587,13 @@ def complete_task(worker_id: str, task_id: int):
             conn.close()
             return False, "Task not found."
 
+        if row["status"] == "cancelled":
+            conn.close()
+            return False, "Task is cancelled."
+
         if row["status"] not in ("pending", "running"):
             conn.close()
             return False, "Task is not active."
-
-        if row["cancel_requested"]:
-            conn.execute(
-                """
-                UPDATE tasks
-                SET
-                    status = 'cancelled',
-                    finished_at = ?
-                WHERE id = ?
-                """,
-                (
-                    utc_now(),
-                    task_id,
-                ),
-            )
-
-            conn.commit()
-            conn.close()
-
-            return False, "Task was cancelled."
 
         conn.execute(
             """
@@ -644,6 +615,7 @@ def complete_task(worker_id: str, task_id: int):
     return True, "Task completed."
 
 
+
 def add_report(
     task_id: int,
     content: str,
@@ -656,6 +628,25 @@ def add_report(
 
     with db_lock:
         conn = get_connection()
+        
+        # التحقق من حالة المهمة قبل إضافة التقرير
+        task = conn.execute(
+            """
+            SELECT status
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        
+        if not task:
+            conn.close()
+            return None, "Task not found."
+        
+        # رفض إضافة تقرير إذا كانت المهمة ملغية
+        if task["status"] == "cancelled":
+            conn.close()
+            return None, "Task is cancelled."
 
         cursor = conn.execute(
             """
@@ -680,7 +671,7 @@ def add_report(
         conn.commit()
         conn.close()
 
-    return report_id
+    return report_id, "Report added."
 
 
 def get_task_reports(task_id: int):
@@ -705,7 +696,6 @@ def get_task_reports(task_id: int):
         conn.close()
 
     return rows
-
 
 def get_recent_tasks(worker_id: str, limit: int = 3):
     with db_lock:
@@ -769,6 +759,7 @@ def add_task_file(
         conn.close()
 
     return file_id
+
 
 
 def get_task_files(task_id: int):
@@ -945,12 +936,20 @@ def worker_report(data: TaskReport):
         data.task_id,
     )
 
-    # إضافة التقرير
-    report_id = add_report(
+    # إضافة التقرير مع التحقق من حالة المهمة
+    report_id, message = add_report(
         task["id"],
         data.content,
         "text",
     )
+
+    if report_id is None:
+        # إذا كانت المهمة ملغية، نرفض التقرير بدون خطأ HTTP
+        return {
+            "success": False,
+            "message": message,
+            "report_id": None,
+        }
 
     # إنهاء المهمة تلقائياً بعد إضافة التقرير
     complete_task(worker["worker_id"], task["id"])
@@ -959,6 +958,7 @@ def worker_report(data: TaskReport):
         "success": True,
         "report_id": report_id,
     }
+
 
 @app.post("/worker/upload")
 async def worker_upload(
@@ -970,6 +970,13 @@ async def worker_upload(
         token,
         task_id,
     )
+    
+    # رفض رفع الملفات للمهام الملغية
+    if task["status"] == "cancelled":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot upload files for cancelled tasks.",
+        )
 
     if task["status"] not in ("pending", "running"):
         raise HTTPException(
@@ -1024,25 +1031,6 @@ async def worker_upload(
 # ============================================================
 # Admin API - optional
 # ============================================================
-
-@app.get("/admin/workers")
-def admin_workers():
-    rows = get_workers()
-
-    return {
-        "workers": [
-            {
-                "worker_id": row["worker_id"],
-                "name": row["name"],
-                "last_seen": row["last_seen"],
-                "active": worker_is_active(
-                    row["last_seen"]
-                ),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
-    }
 
 
 # ============================================================
