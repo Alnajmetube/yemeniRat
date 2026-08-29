@@ -7,37 +7,30 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build-termux-armv7:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: سحب الكود
         uses: actions/checkout@v4
 
-      - name: Set up QEMU for ARMv7
+      - name: إعداد QEMU لمحاكاة ARMv7
         uses: docker/setup-qemu-action@v3
 
-      - name: Build binary inside Termux ARMv7 container
+      - name: بناء الملف الثنائي داخل حاوية Termux ARMv7
         run: |
           docker run --rm \
             --platform linux/arm/v7 \
-            -v "${{ github.workspace }}:/workspace" \
+            -v ${{ github.workspace }}:/workspace \
             -w /workspace \
             termux/termux-docker:arm bash -c "
               set -e
-
               pkg update -y && pkg upgrade -y
               pkg install python clang build-essential patchelf zstd ccache -y
-
               pip install --upgrade pip
               pip install -r client_requirements.txt
               pip install nuitka
-
-              mkdir -p build
 
               nuitka --standalone \
                      --onefile \
@@ -50,25 +43,9 @@ jobs:
               strip build/worker-armv7l
             "
 
-      - name: Upload binary artifact
+      - name: رفع الملف الناتج
         uses: actions/upload-artifact@v4
         with:
           name: worker-armv7l-termux
           path: build/worker-armv7l
           if-no-files-found: error
-
-      - name: Commit binary to repository
-        if: github.event_name != 'pull_request'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add build/worker-armv7l
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "build: update ARMv7 Termux binary [skip ci]"
-          git push

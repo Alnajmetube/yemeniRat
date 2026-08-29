@@ -1,0 +1,403 @@
+name: Build All Worker Binaries
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-all-binaries
+  cancel-in-progress: false
+
+jobs:
+
+  # =========================================================
+  # Ubuntu x64
+  # =========================================================
+
+  build-ubuntu:
+    name: Build Ubuntu ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-20.04, ubuntu-22.04]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential patchelf python3-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r client_requirements.txt
+          pip install nuitka
+
+      - name: Build binary
+        run: |
+          mkdir -p build
+
+          nuitka \
+            --standalone \
+            --onefile \
+            --output-dir=build \
+            --output-filename=worker_${{ matrix.os }} \
+            client.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-${{ matrix.os }}
+          path: build/worker_${{ matrix.os }}
+          if-no-files-found: error
+
+
+  # =========================================================
+  # Linux ARM64
+  # =========================================================
+
+  build-linux-arm64:
+    name: Build Linux ARM64
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential patchelf python3-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r client_requirements.txt
+          pip install nuitka
+
+      - name: Build binary
+        run: |
+          mkdir -p build
+
+          nuitka \
+            --standalone \
+            --onefile \
+            --output-dir=build \
+            --output-filename=worker-linux-arm64 \
+            client.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-linux-arm64
+          path: build/worker-linux-arm64
+          if-no-files-found: error
+
+
+  # =========================================================
+  # Linux ARMv7
+  # =========================================================
+
+  build-linux-armv7:
+    name: Build Linux ARMv7
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build binary
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            python:3.10-slim \
+            bash -c "
+              set -e
+
+              apt-get update
+
+              apt-get install -y --no-install-recommends \
+                gcc \
+                g++ \
+                make \
+                patchelf \
+                zstd \
+                ccache \
+                python3-dev \
+                binutils
+
+              pip install --upgrade pip
+              pip install -r client_requirements.txt
+              pip install nuitka
+
+              mkdir -p build
+
+              python -m nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --remove-output \
+                --output-dir=build \
+                --output-filename=worker-linux-armv7l \
+                client.py
+
+              strip build/worker-linux-armv7l
+            "
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-linux-armv7l
+          path: build/worker-linux-armv7l
+          if-no-files-found: error
+
+
+  # =========================================================
+  # Termux ARM64
+  # =========================================================
+
+  build-termux-arm64:
+    name: Build Termux ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build binary
+        run: |
+          mkdir -p "${{ github.workspace }}/build"
+
+          sudo chmod -R 777 "${{ github.workspace }}"
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            termux/termux-docker:aarch64 \
+            bash -c "
+              set -e
+
+              pkg update -y
+              pkg upgrade -y
+
+              pkg install \
+                python \
+                clang \
+                build-essential \
+                patchelf \
+                zstd \
+                ccache \
+                termux-elf-cleaner \
+                ldd \
+                binutils \
+                -y
+
+              pip install --upgrade pip
+              pip install -r /workspace/client_requirements.txt
+              pip install nuitka
+
+              WORK_DIR=\$HOME/work
+
+              mkdir -p \$WORK_DIR
+              cp -r /workspace/* \$WORK_DIR/
+
+              cd \$WORK_DIR
+
+              mkdir -p build_out
+
+              nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --remove-output \
+                --output-dir=build_out \
+                --output-filename=termux_client_arm64 \
+                client.py
+
+              strip build_out/termux_client_arm64
+
+              cp build_out/termux_client_arm64 \
+                /workspace/build/
+            "
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-client-arm64
+          path: build/termux_client_arm64
+          if-no-files-found: error
+
+
+  # =========================================================
+  # Termux ARMv7
+  # =========================================================
+
+  build-termux-armv7:
+    name: Build Termux ARMv7
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build binary
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            termux/termux-docker:arm \
+            bash -c "
+              set -e
+
+              pkg update -y
+              pkg upgrade -y
+
+              pkg install \
+                python \
+                clang \
+                build-essential \
+                patchelf \
+                zstd \
+                ccache \
+                -y
+
+              pip install --upgrade pip
+              pip install -r client_requirements.txt
+              pip install nuitka
+
+              mkdir -p build
+
+              nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --remove-output \
+                --output-dir=build \
+                --output-filename=worker-armv7l \
+                client.py
+
+              strip build/worker-armv7l
+            "
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-armv7l-termux
+          path: build/worker-armv7l
+          if-no-files-found: error
+
+
+  # =========================================================
+  # Collect all binaries
+  # =========================================================
+
+  collect:
+    name: Collect all binaries
+    needs:
+      - build-ubuntu
+      - build-linux-arm64
+      - build-linux-armv7
+      - build-termux-arm64
+      - build-termux-armv7
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Ubuntu 20.04
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-ubuntu-20.04
+          path: build
+
+      - name: Download Ubuntu 22.04
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-ubuntu-22.04
+          path: build
+
+      - name: Download Linux ARM64
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-linux-arm64
+          path: build
+
+      - name: Download Linux ARMv7
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-linux-armv7l
+          path: build
+
+      - name: Download Termux ARM64
+        uses: actions/download-artifact@v4
+        with:
+          name: termux-client-arm64
+          path: build
+
+      - name: Download Termux ARMv7
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-armv7l-termux
+          path: build
+
+      - name: Make binaries executable
+        run: |
+          chmod +x build/*
+
+      - name: Show generated files
+        run: |
+          ls -lh build
+
+      # =====================================================
+      # Commit everything in ONE operation
+      # =====================================================
+
+      - name: Commit binaries to repository
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add build/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "build: update all worker binaries [skip ci]"
+
+          git push
