@@ -7,31 +7,39 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-armv7:
     runs-on: ubuntu-latest
 
     steps:
-      - name: سحب الكود
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: إعداد QEMU لمحاكاة ARMv7
+      - name: Set up QEMU for ARMv7
         uses: docker/setup-qemu-action@v3
 
-      - name: بناء الملف الثنائي داخل حاوية Linux ARMv7
+      - name: Build binary inside Linux ARMv7 container
         run: |
           docker run --rm \
             --platform linux/arm/v7 \
-            -v ${{ github.workspace }}:/workspace \
+            -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             python:3.10-slim \
             bash -c "
               set -e
-              apt-get update && apt-get install -y --no-install-recommends \
+
+              apt-get update
+              apt-get install -y --no-install-recommends \
                 gcc g++ make patchelf zstd ccache python3-dev binutils
+
               pip install --upgrade pip
               pip install -r client_requirements.txt
               pip install nuitka
+
+              mkdir -p build
 
               python -m nuitka \
                 --standalone \
@@ -45,9 +53,25 @@ jobs:
               strip build/worker-armv7l
             "
 
-      - name: رفع الملف الناتج
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: worker-armv7l
           path: build/worker-armv7l
           if-no-files-found: error
+
+      - name: Commit binary to repository
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add build/worker-armv7l
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "build: update ARMv7 binary [skip ci]"
+          git push

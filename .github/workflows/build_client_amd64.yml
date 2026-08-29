@@ -7,9 +7,12 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    runs-on: ubuntu-22.04-arm  # ARM64 runner provided by GitHub
+    runs-on: ubuntu-22.04-arm
 
     steps:
       - name: Checkout code
@@ -27,16 +30,40 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r client_requirements.txt
           pip install nuitka
 
       - name: Build standalone binary with Nuitka
         run: |
-          nuitka --standalone --onefile --output-dir=build --output-filename=client client.py
+          mkdir -p build
+
+          nuitka \
+            --standalone \
+            --onefile \
+            --output-dir=build \
+            --output-filename=client \
+            client.py
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: client-arm64
           path: build/client
+          if-no-files-found: error
+
+      - name: Commit binary to repository
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add build/client
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "build: update ARM64 binary [skip ci]"
+          git push

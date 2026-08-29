@@ -7,11 +7,15 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-20.04, ubuntu-22.04]  # بناء نسختين
+        os: [ubuntu-20.04, ubuntu-22.04]
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -38,7 +42,10 @@ jobs:
 
       - name: Build standalone binary with Nuitka
         run: |
-          nuitka --standalone --onefile \
+          mkdir -p build
+
+          nuitka --standalone \
+                 --onefile \
                  --output-dir=build \
                  --output-filename=worker_${{ matrix.os }} \
                  client.py
@@ -48,3 +55,20 @@ jobs:
         with:
           name: client_${{ matrix.os }}
           path: build/worker_${{ matrix.os }}
+          if-no-files-found: error
+
+      - name: Commit binary to repository
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add build/worker_${{ matrix.os }}
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "build: update ${{ matrix.os }} worker binary [skip ci]"
+          git push
