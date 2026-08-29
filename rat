@@ -1,277 +1,209 @@
 #!/usr/bin/env bash
-# Worker Client - Stable, silent, persistent daemon with autostart via .bashrc
-
-# Uncomment next line for debugging (logs will include every command)
-# set -x
+# -*- coding: utf-8 -*-
+# Worker Client for centralized task management (Bash version)
+# Runs in foreground
 
 set -euo pipefail
 
-# ----------------------------- Configuration -----------------------------
-CONFIG_FILE="${HOME}/.worker_client.conf"
+# ============================ Constants ====================================
+HOME_DIR="${HOME:-$HOME}"
+CONFIG_PATH="${HOME_DIR}/.worker_client.conf"
+LOG_PATH="${HOME_DIR}/.worker_client.log"
+QUEUE_DIR="${HOME_DIR}/.worker_client_queue"
 LOCK_FILE="/tmp/worker_client.lock"
 PID_FILE="/tmp/worker_client.pid"
-QUEUE_DIR="${HOME}/.worker_client_queue"
-LOG_FILE="${HOME}/.worker_client.log"
 
-TASK_POLL_INTERVAL=2
+DEFAULT_POLL_INTERVAL=2
+MAX_BACKOFF=60
+HEALTH_CHECK_INTERVAL=60
 CANCEL_CHECK_INTERVAL=2
-HEALTH_INTERVAL=60
-BACKOFF_MIN=2
-BACKOFF_MAX=60
-CURRENT_BACKOFF=$BACKOFF_MIN
-CONNECT_TIMEOUT=10
-MAX_TIME=30
+MAX_REPORT_LENGTH=10000
 
-# ----------------------------- Helper Functions ---------------------------
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+# ============================ Logging ======================================
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $*"
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_PATH"
 }
 
-check_deps() {
-    for cmd in curl jq; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            echo "ERROR: Required command '$cmd' not found." >&2
-            exit 1
-        fi
-    done
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2
+    echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_PATH"
 }
 
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2
+    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_PATH"
+}
+
+log_debug() {
+    echo -e "${BLUE}[DEBUG]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $*"
+    echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_PATH"
+}
+
+# ============================ Configuration ===============================
+load_config() {
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+        log_error "Config file not found: $CONFIG_PATH"
+        exit 1
+    fi
+    
+    # Source the config file
+    # shellcheck source=/dev/null
+    source "$CONFIG_PATH"
+    
+    if [[ -z "${SERVER_URL:-}" ]] || [[ -z "${TOKEN:-}" ]]; then
+        log_error "Missing required config keys: SERVER_URL and TOKEN"
+        exit 1
+    fi
+    
+    export SERVER_URL TOKEN
+}
+
+write_config() {
+    local url="$1"
+    local token="$2"
+    cat > "$CONFIG_PATH" <<EOF
+SERVER_URL="$url"
+TOKEN="$token"
+EOF
+    chmod 600 "$CONFIG_PATH"
+}
+
+# ============================ Lock and PID ================================
 acquire_lock() {
+    # Use flock for locking
     exec 200>"$LOCK_FILE"
     if ! flock -n 200; then
-        log "ERROR: Another instance is running (lock held). Exiting."
-        exit 0
+        return 1
     fi
-    echo $$ > "$PID_FILE"
-    log "Lock acquired (PID $$)"
-    trap 'release_lock' EXIT
+    echo $$ > "$LOCK_FILE"
+    return 0
 }
 
 release_lock() {
-    log "Releasing lock"
-    rm -f "$PID_FILE" 2>/dev/null || true
     flock -u 200 2>/dev/null || true
 }
 
-load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        # shellcheck source=/dev/null
-        source "$CONFIG_FILE"
-        log "Config loaded: SERVER_URL=$SERVER_URL, TOKEN=${TOKEN:0:4}..."
-    else
-        log "ERROR: Config file not found. Run with --install first."
-        exit 1
-    fi
-    if [[ -z "${SERVER_URL:-}" || -z "${TOKEN:-}" ]]; then
-        log "ERROR: SERVER_URL or TOKEN not set in config."
-        exit 1
-    fi
+write_pid() {
+    echo $$ > "$PID_FILE"
 }
 
-# ----------------------------- HTTP Helpers (with Accept header) -----------
+remove_pid() {
+    rm -f "$PID_FILE"
+}
+
+# ============================ HTTP Client =================================
+# Use curl for HTTP requests
 
 http_get() {
     local url="$1"
-    shift
-    local response http_code curl_exit
-    response=$(curl -s -w "%{http_code}" -H "Accept: application/json" \
-        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -X GET "$url" "$@" 2>/dev/null)
-    curl_exit=$?
-    if [[ $curl_exit -ne 0 ]]; then
-        log "curl GET failed with exit $curl_exit"
-        return 2  # network error
-    fi
-    http_code="${response: -3}"
-    response="${response%???}"
-    if [[ "$http_code" -ge 400 ]]; then
-        log "HTTP GET error: $http_code - $response"
-        return 1  # HTTP error
-    fi
-    echo "$response"
-    return 0
+    local timeout="${2:-10}"
+    curl -s -f -m "$timeout" "$url" 2>/dev/null || echo ""
 }
 
 http_post() {
     local url="$1"
     local data="$2"
-    local content_type="${3:-application/json}"
-    local response http_code curl_exit
-    response=$(curl -s -w "%{http_code}" -H "Accept: application/json" -H "Content-Type: $content_type" \
-        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -X POST "$url" -d "$data" 2>/dev/null)
-    curl_exit=$?
-    if [[ $curl_exit -ne 0 ]]; then
-        log "curl POST failed with exit $curl_exit"
-        return 2
-    fi
-    http_code="${response: -3}"
-    response="${response%???}"
-    if [[ "$http_code" -ge 400 ]]; then
-        log "HTTP POST error: $http_code - $response"
-        return 1
-    fi
-    echo "$response"
-    return 0
+    local timeout="${3:-10}"
+    curl -s -f -m "$timeout" -X POST -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || echo ""
 }
 
-http_upload() {
+http_post_file() {
     local url="$1"
     local file_path="$2"
-    local token="$3"
-    local task_id="$4"
-    local response http_code curl_exit
-    response=$(curl -s -w "%{http_code}" -H "Accept: application/json" \
-        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -X POST "$url" \
-        -F "token=$token" -F "task_id=$task_id" -F "file=@$file_path" 2>/dev/null)
-    curl_exit=$?
-    if [[ $curl_exit -ne 0 ]]; then
-        log "curl UPLOAD failed with exit $curl_exit"
-        return 2
-    fi
-    http_code="${response: -3}"
-    response="${response%???}"
-    if [[ "$http_code" -ge 400 ]]; then
-        log "HTTP UPLOAD error: $http_code - $response"
-        return 1
-    fi
-    echo "$response"
-    return 0
+    local task_id="$3"
+    local token="$4"
+    local timeout="${5:-30}"
+    curl -s -f -m "$timeout" -X POST \
+        -F "token=$token" \
+        -F "task_id=$task_id" \
+        -F "file=@$file_path" \
+        "$url" 2>/dev/null || echo ""
 }
 
-# ----------------------------- Queue Helpers -----------------------------
-
-queue_report() {
-    local task_id="$1"
-    local content="$2"
-    mkdir -p "$QUEUE_DIR"
-    echo "$content" > "$QUEUE_DIR/report_${task_id}.txt"
-    log "Queued report for task $task_id"
-}
-
-queue_upload() {
-    local task_id="$1"
-    local file_path="$2"
-    mkdir -p "$QUEUE_DIR"
-    cp "$file_path" "$QUEUE_DIR/upload_${task_id}.file"
-    log "Queued upload for task $task_id"
-}
-
-process_queue() {
-    local task_id content f
-    for f in "$QUEUE_DIR"/report_*.txt; do
-        [[ -f "$f" ]] || continue
-        task_id=$(basename "$f" | sed 's/^report_//; s/\.txt$//')
-        content=$(cat "$f")
-        if send_report "$task_id" "$content"; then
-            rm -f "$f"
-            log "Processed queued report for task $task_id"
-        else
-            log "Failed to send queued report for task $task_id, will retry"
-            return 1
-        fi
-    done
-    for f in "$QUEUE_DIR"/upload_*.file; do
-        [[ -f "$f" ]] || continue
-        task_id=$(basename "$f" | sed 's/^upload_//; s/\.file$//')
-        if upload_file "$task_id" "$f"; then
-            rm -f "$f"
-            log "Processed queued upload for task $task_id"
-        else
-            log "Failed to upload queued file for task $task_id, will retry"
-            return 1
-        fi
-    done
-    return 0
-}
-
-# ----------------------------- API Functions -----------------------------
-
+# ============================ API Calls ===================================
 health_check() {
     local url="${SERVER_URL}/worker/health?token=${TOKEN}"
-    if http_get "$url" >/dev/null 2>&1; then
-        log "Health check OK"
-        return 0
-    else
-        log "Health check FAILED"
-        return 1
+    local response
+    response=$(http_get "$url" 10)
+    if [[ -n "$response" ]]; then
+        local status
+        status=$(echo "$response" | jq -r '.status // ""')
+        [[ "$status" == "active" ]] || [[ "$status" == "ok" ]]
+        return $?
     fi
+    return 1
 }
 
 get_current_task() {
     local url="${SERVER_URL}/worker/current-task?token=${TOKEN}"
     local response
-    if ! response=$(http_get "$url"); then
-        log "get_current_task: network or HTTP error"
-        return 2
+    response=$(http_get "$url" 10)
+    if [[ -n "$response" ]]; then
+        # Check if task exists and status is pending
+        local task_status
+        task_status=$(echo "$response" | jq -r '.task.status // ""')
+        if [[ "$task_status" == "pending" ]]; then
+            echo "$response" | jq -c '.task'
+            return 0
+        fi
     fi
-    # Validate JSON
-    if ! echo "$response" | jq . >/dev/null 2>&1; then
-        log "get_current_task: invalid JSON response"
-        echo "null"
-        return 0
-    fi
-    local task_id
-    task_id=$(echo "$response" | jq -r '.task.id // empty')
-    if [[ -z "$task_id" ]]; then
-        echo "null"
-        return 0
-    fi
-    echo "$response"
-    return 0
+    return 1
 }
 
 start_task() {
     local task_id="$1"
-    local url="${SERVER_URL}/worker/start-task"
     local data
-    data=$(jq -n --arg token "$TOKEN" --arg tid "$task_id" '{token: $token, task_id: ($tid | tonumber)}')
+    data=$(jq -n --arg token "$TOKEN" --arg task_id "$task_id" \
+        '{token: $token, task_id: ($task_id | tonumber)}')
+    local url="${SERVER_URL}/worker/start-task"
     local response
-    if ! response=$(http_post "$url" "$data"); then
-        log "start_task: failed to start task $task_id"
-        return 1
+    response=$(http_post "$url" "$data" 10)
+    if [[ -n "$response" ]]; then
+        local status
+        status=$(echo "$response" | jq -r '.status // ""')
+        [[ "$status" == "running" ]]
+        return $?
     fi
-    local status
-    status=$(echo "$response" | jq -r '.status // "unknown"')
-    if [[ "$status" == "running" ]]; then
-        log "start_task: task $task_id started successfully"
-        return 0
-    else
-        log "start_task: server returned status '$status' for task $task_id"
-        return 1
-    fi
+    return 1
 }
 
-check_cancellation() {
+is_cancelled() {
     local task_id="$1"
     local url="${SERVER_URL}/worker/is-cancelled?token=${TOKEN}&task_id=${task_id}"
     local response
-    if ! response=$(http_get "$url"); then
-        log "check_cancellation: error, assuming not cancelled"
-        return 1  # assume not cancelled on error
+    response=$(http_get "$url" 10)
+    if [[ -n "$response" ]]; then
+        local cancelled
+        cancelled=$(echo "$response" | jq -r '.cancelled // false')
+        [[ "$cancelled" == "true" ]]
+        return $?
     fi
-    local cancelled
-    cancelled=$(echo "$response" | jq -r '.cancelled // false')
-    if [[ "$cancelled" == "true" ]]; then
-        log "Task $task_id was cancelled by server"
-        return 0
-    else
-        return 1
-    fi
+    return 1
 }
 
 send_report() {
     local task_id="$1"
     local content="$2"
-    local url="${SERVER_URL}/worker/report"
     local data
-    data=$(jq -n --arg token "$TOKEN" --arg tid "$task_id" --arg cnt "$content" '{token: $token, task_id: ($tid | tonumber), content: $cnt}')
-    local response
-    if ! response=$(http_post "$url" "$data"); then
-        log "send_report: failed for task $task_id"
-        return 1
+    # Truncate content if too long
+    if [[ ${#content} -gt $MAX_REPORT_LENGTH ]]; then
+        content="${content:0:$MAX_REPORT_LENGTH}\n... (truncated)"
     fi
-    log "send_report: success for task $task_id"
-    return 0
+    data=$(jq -n --arg token "$TOKEN" --arg task_id "$task_id" --arg content "$content" \
+        '{token: $token, task_id: ($task_id | tonumber), content: $content}')
+    local url="${SERVER_URL}/worker/report"
+    local response
+    response=$(http_post "$url" "$data" 10)
+    [[ -n "$response" ]] && echo "$response" | jq -e '. == true' >/dev/null 2>&1
+    return $?
 }
 
 upload_file() {
@@ -279,290 +211,358 @@ upload_file() {
     local file_path="$2"
     local url="${SERVER_URL}/worker/upload"
     local response
-    if ! response=$(http_upload "$url" "$file_path" "$TOKEN" "$task_id"); then
-        log "upload_file: failed for task $task_id"
-        return 1
-    fi
-    log "upload_file: success for task $task_id"
-    return 0
+    response=$(http_post_file "$url" "$file_path" "$task_id" "$TOKEN" 30)
+    [[ -n "$response" ]] && echo "$response" | jq -e '. == true' >/dev/null 2>&1
+    return $?
 }
 
-# ----------------------------- Task Execution ----------------------------
+# ============================ Queue Management ============================
+queue_report() {
+    local task_id="$1"
+    local content="$2"
+    mkdir -p "$QUEUE_DIR"
+    local queue_file="${QUEUE_DIR}/report_${task_id}.json"
+    jq -n --arg task_id "$task_id" --arg content "$content" \
+        '{task_id: ($task_id | tonumber), content: $content}' > "$queue_file"
+}
 
-execute_task() {
+queue_upload() {
+    local task_id="$1"
+    local file_path="$2"
+    mkdir -p "$QUEUE_DIR"
+    local queue_file="${QUEUE_DIR}/upload_${task_id}.file"
+    cp "$file_path" "$queue_file"
+}
+
+process_queue() {
+    if [[ ! -d "$QUEUE_DIR" ]]; then
+        return
+    fi
+    
+    # Process reports
+    for queue_file in "$QUEUE_DIR"/report_*.json; do
+        [[ -f "$queue_file" ]] || continue
+        local task_id
+        local content
+        task_id=$(jq -r '.task_id' "$queue_file")
+        content=$(jq -r '.content' "$queue_file")
+        if send_report "$task_id" "$content"; then
+            rm -f "$queue_file"
+            log_info "Queued report for task $task_id sent."
+        else
+            log_warn "Queued report for task $task_id still failing."
+        fi
+    done
+    
+    # Process uploads
+    for queue_file in "$QUEUE_DIR"/upload_*.file; do
+        [[ -f "$queue_file" ]] || continue
+        local task_id
+        task_id=$(basename "$queue_file" | sed 's/upload_\([0-9]*\)\.file/\1/')
+        if upload_file "$task_id" "$queue_file"; then
+            rm -f "$queue_file"
+            log_info "Queued upload for task $task_id sent."
+        else
+            log_warn "Queued upload for task $task_id still failing."
+        fi
+    done
+}
+
+# ============================ Upload Handler ==============================
+handle_upload_command() {
     local task_id="$1"
     local command="$2"
-    local output_file
-    output_file=$(mktemp -p /tmp "worker_out_${task_id}_XXXXXX")
-    trap 'rm -f "$output_file"' RETURN
-
-    log "Executing task $task_id: $command"
-    eval "$command" > "$output_file" 2>&1 &
-    local cmd_pid=$!
-    local cancelled=0
-
-    while kill -0 "$cmd_pid" 2>/dev/null; do
-        if check_cancellation "$task_id"; then
-            cancelled=1
-            log "Task $task_id cancelled, terminating process $cmd_pid"
-            kill -TERM "$cmd_pid" 2>/dev/null || true
-            sleep 2
-            kill -KILL "$cmd_pid" 2>/dev/null || true
-            wait "$cmd_pid" 2>/dev/null || true
-            break
-        fi
-        sleep "$CANCEL_CHECK_INTERVAL"
-    done
-
-    if [[ $cancelled -eq 0 ]]; then
-        wait "$cmd_pid"
-        local exit_code=$?
-        log "Task $task_id finished with exit code $exit_code"
+    
+    # Extract file path
+    local file_path_str
+    file_path_str=$(echo "$command" | cut -d' ' -f2- | xargs)
+    
+    if [[ -z "$file_path_str" ]]; then
+        local error_msg="Upload command missing file path. Usage: upload <file_path>"
+        log_error "Task $task_id: $error_msg"
+        send_report "$task_id" "$error_msg"
+        return
+    fi
+    
+    local file_path="$file_path_str"
+    
+    if [[ ! -f "$file_path" ]]; then
+        local error_msg="File not found: $file_path_str"
+        log_error "Task $task_id: $error_msg"
+        send_report "$task_id" "$error_msg"
+        return
+    fi
+    
+    log_info "Task $task_id: Uploading file $(basename "$file_path")"
+    
+    if ! start_task "$task_id"; then
+        log_error "Task $task_id: Failed to start task"
+        return
+    fi
+    
+    local file_size
+    file_size=$(stat -c%s "$file_path" 2>/dev/null || stat -f%z "$file_path" 2>/dev/null || echo "0")
+    
+    if upload_file "$task_id" "$file_path"; then
+        local report_content="File uploaded successfully: $(basename "$file_path") (Size: $file_size bytes)"
+        log_info "Task $task_id: $report_content"
     else
-        wait "$cmd_pid" 2>/dev/null || true
-        local exit_code=$?
-        log "Task $task_id was cancelled, exit code $exit_code"
-        return 1  # cancelled
+        local report_content="Failed to upload file: $(basename "$file_path")"
+        log_warn "Task $task_id: $report_content"
+        queue_upload "$task_id" "$file_path"
     fi
-
-    local output_content=""
-    local report_msg=""
-    if [[ -s "$output_file" ]]; then
-        output_content=$(head -c 1000 "$output_file")
+    
+    if ! send_report "$task_id" "$report_content"; then
+        log_warn "Task $task_id: Report failed, queuing."
+        queue_report "$task_id" "$report_content"
     fi
-    report_msg="Exit code: ${exit_code}. Output: ${output_content}"
+}
 
-    local upload_success=0
-    if [[ -s "$output_file" ]]; then
-        if upload_file "$task_id" "$output_file"; then
-            upload_success=1
-        else
-            queue_upload "$task_id" "$output_file"
-        fi
+# ============================ Task Execution ==============================
+execute_task() {
+    local task="$1"
+    local task_id content command
+    task_id=$(echo "$task" | jq -r '.id')
+    content=$(echo "$task" | jq -r '.content')
+    command="$content"
+    
+    log_info "Executing task $task_id: $command"
+    
+    # Special command: upload
+    if [[ "$(echo "$command" | tr '[:upper:]' '[:lower:]' | xargs)" == upload* ]]; then
+        handle_upload_command "$task_id" "$command"
+        return
     fi
-
-    if [[ $upload_success -eq 1 ]]; then
-        report_msg="Task completed. Output file uploaded. ${report_msg}"
+    
+    # Normal shell command
+    if ! start_task "$task_id"; then
+        log_error "Failed to start task $task_id, aborting."
+        return
+    fi
+    
+    # Create temp file for output
+    local temp_output
+    temp_output=$(mktemp)
+    local temp_error
+    temp_error=$(mktemp)
+    
+    # Run command with timeout and output capture
+    local exit_code=0
+    {
+        # Run the command
+        eval "$command" > "$temp_output" 2> "$temp_error" &
+        local pid=$!
+        
+        # Check for cancellation periodically
+        while kill -0 $pid 2>/dev/null; do
+            if is_cancelled "$task_id"; then
+                log_info "Task $task_id cancelled, terminating process."
+                kill -TERM $pid 2>/dev/null || true
+                sleep 2
+                kill -KILL $pid 2>/dev/null || true
+                wait $pid 2>/dev/null || true
+                local report_content="Task cancelled by server."
+                send_report "$task_id" "$report_content"
+                rm -f "$temp_output" "$temp_error"
+                return
+            fi
+            sleep "$CANCEL_CHECK_INTERVAL"
+        done
+        
+        wait $pid 2>/dev/null || true
+        exit_code=$?
+    }
+    
+    # Read outputs
+    local stdout_content=""
+    local stderr_content=""
+    if [[ -f "$temp_output" ]]; then
+        stdout_content=$(cat "$temp_output" 2>/dev/null || echo "")
+    fi
+    if [[ -f "$temp_error" ]]; then
+        stderr_content=$(cat "$temp_error" 2>/dev/null || echo "")
+    fi
+    
+    rm -f "$temp_output" "$temp_error"
+    
+    # Build report
+    local report_content=""
+    if [[ -n "$stdout_content" ]] && [[ -n "$stderr_content" ]]; then
+        report_content="${stdout_content}\n${stderr_content}"
+    elif [[ -n "$stdout_content" ]]; then
+        report_content="$stdout_content"
+    elif [[ -n "$stderr_content" ]]; then
+        report_content="$stderr_content"
     else
-        report_msg="Task completed. Output file queued for upload. ${report_msg}"
+        report_content="(empty output)"
     fi
-
-    if ! send_report "$task_id" "$report_msg"; then
-        queue_report "$task_id" "$report_msg"
+    
+    log_info "Task $task_id completed with exit code $exit_code"
+    
+    # Send report
+    if ! send_report "$task_id" "$report_content"; then
+        log_warn "Task $task_id report failed, queuing."
+        queue_report "$task_id" "$report_content"
     fi
-
-    return 0
 }
 
-# ----------------------------- Exponential Backoff -----------------------
-
-reset_backoff() {
-    CURRENT_BACKOFF=$BACKOFF_MIN
-}
-
-increase_backoff() {
-    local next=$((CURRENT_BACKOFF * 2))
-    if [[ $next -gt $BACKOFF_MAX ]]; then
-        CURRENT_BACKOFF=$BACKOFF_MAX
-    else
-        CURRENT_BACKOFF=$next
-    fi
-    log "Increased backoff to $CURRENT_BACKOFF"
-}
-
-wait_with_backoff() {
-    log "Waiting $CURRENT_BACKOFF seconds before retry"
-    sleep "$CURRENT_BACKOFF"
-}
-
-# ----------------------------- Main Loop --------------------------------
-
+# ============================ Main Loop ===================================
 run_forever() {
-    local health_counter=0
-    log "Entering main loop"
-
+    local backoff=$DEFAULT_POLL_INTERVAL
+    local last_health_check=0
+    
+    log_info "Starting worker in foreground mode..."
+    log_info "Server: $SERVER_URL"
+    
     while true; do
-        if process_queue; then
-            reset_backoff
+        # Process queue first
+        process_queue
+        
+        # Health check periodically
+        local now
+        now=$(date +%s)
+        if (( now - last_health_check >= HEALTH_CHECK_INTERVAL )); then
+            if health_check; then
+                log_debug "Health check OK"
+            else
+                log_warn "Health check failed (server may be down)"
+            fi
+            last_health_check=$now
+        fi
+        
+        # Get current task
+        local task
+        task=$(get_current_task 2>/dev/null || echo "")
+        
+        if [[ -n "$task" ]]; then
+            backoff=$DEFAULT_POLL_INTERVAL
+            execute_task "$task"
         else
-            increase_backoff
+            log_debug "No pending task, sleeping for ${backoff}s..."
+            sleep "$backoff"
         fi
-
-        health_counter=$((health_counter + 1))
-        if [[ $health_counter -ge $((HEALTH_INTERVAL / TASK_POLL_INTERVAL)) ]]; then
-            health_check || true
-            health_counter=0
-        fi
-
-        local task_response
-        if ! task_response=$(get_current_task); then
-            increase_backoff
-            wait_with_backoff
-            continue
-        fi
-
-        reset_backoff
-
-        if [[ "$task_response" == "null" ]]; then
-            # No task, just wait
-            sleep "$TASK_POLL_INTERVAL"
-            continue
-        fi
-
-        local task_id content status
-        task_id=$(echo "$task_response" | jq -r '.task.id')
-        content=$(echo "$task_response" | jq -r '.task.content')
-        status=$(echo "$task_response" | jq -r '.task.status // "pending"')
-
-        log "Received task $task_id with status $status"
-
-        if [[ "$status" != "pending" && "$status" != "running" ]]; then
-            sleep "$TASK_POLL_INTERVAL"
-            continue
-        fi
-
-        if ! start_task "$task_id"; then
-            sleep "$TASK_POLL_INTERVAL"
-            continue
-        fi
-
-        execute_task "$task_id" "$content" || true
     done
 }
 
-# ----------------------------- Install / Uninstall -----------------------
+# ============================ Install / Uninstall / Stop ==================
+install_worker() {
+    local url="$1"
+    local token="$2"
+    
+    log_info "Installing with SERVER_URL=$url"
+    
+    write_config "$url" "$token"
+    mkdir -p "$QUEUE_DIR"
+    
+    log_info "Installation complete."
+    log_info "You can run the worker with: $0"
+}
 
-do_install() {
-    local url=""
-    local token=""
+uninstall_worker() {
+    log_info "Uninstalling worker client..."
+    
+    # Remove files
+    rm -f "$CONFIG_PATH"
+    rm -rf "$QUEUE_DIR"
+    rm -f "$LOCK_FILE" "$PID_FILE"
+    
+    log_info "Uninstall complete."
+}
 
+# ============================ Signal Handlers =============================
+cleanup() {
+    log_info "Received signal, shutting down..."
+    remove_pid
+    release_lock
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# ============================ Main Entry ==================================
+main() {
+    # Parse arguments
+    local action="run"
+    local install_url=""
+    local install_token=""
+    
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --install) shift ;;
-            --url)
-                url="$2"
-                shift 2
+            --install)
+                action="install"
+                shift
+                install_url="$1"
+                shift
+                install_token="$1"
+                shift
                 ;;
-            --token)
-                token="$2"
-                shift 2
+            --uninstall)
+                action="uninstall"
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: $0 [OPTIONS]"
+                echo "Options:"
+                echo "  --install <URL> <TOKEN>  Install worker client"
+                echo "  --uninstall              Uninstall worker client"
+                echo "  --help, -h              Show this help message"
+                echo ""
+                echo "Without options, runs the worker in foreground."
+                exit 0
                 ;;
             *)
-                echo "Unknown option: $1" >&2
+                echo "Unknown option: $1"
+                echo "Use --help for usage information."
                 exit 1
                 ;;
         esac
     done
-
-    if [[ -z "$url" || -z "$token" ]]; then
-        echo "Usage: $0 --install --url <URL> --token <TOKEN>" >&2
-        exit 1
-    fi
-
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    cat > "$CONFIG_FILE" <<EOF
-SERVER_URL="$url"
-TOKEN="$token"
-EOF
-    chmod 600 "$CONFIG_FILE"
-    echo "Configuration written to $CONFIG_FILE"
-
-    local script_path
-    script_path="$(realpath "$0")"
-    chmod +x "$script_path"
-    echo "Made script executable."
-
-    # Add to .bashrc
-    local bashrc_line="( flock -n /tmp/worker_client.lock -c \"$script_path\" </dev/null >/dev/null 2>&1 & )"
-    if ! grep -Fxq "$bashrc_line" "$HOME/.bashrc" 2>/dev/null; then
-        echo "$bashrc_line" >> "$HOME/.bashrc"
-        echo "Added autostart to ~/.bashrc"
-    else
-        echo "Autostart entry already exists in ~/.bashrc"
-    fi
-
-    # Start the worker immediately in background using nohup (more reliable)
-    # Use --foreground to prevent re‑forking when started from terminal
-    nohup bash "$script_path" --foreground </dev/null >/dev/null 2>&1 &
-    echo "Worker started in background (nohup). Check $LOG_FILE for logs."
-
-    echo "Installation complete."
-}
-
-do_uninstall() {
-    local script_path
-    script_path="$(realpath "$0")"
-    local bashrc_line="( flock -n /tmp/worker_client.lock -c \"$script_path\" </dev/null >/dev/null 2>&1 & )"
-    if [[ -f "$HOME/.bashrc" ]]; then
-        sed -i "\|$bashrc_line|d" "$HOME/.bashrc"
-        echo "Removed autostart from ~/.bashrc"
-    fi
-    rm -f "$LOCK_FILE" "$PID_FILE" 2>/dev/null || true
-    echo "Cleaned up lock and PID files."
-    echo "Uninstall complete. The worker will not start again in new shells."
-}
-
-# ----------------------------- Main --------------------------------------
-main() {
-    # ============================================================
-    # Command-line arguments
-    # ============================================================
-
-    if [[ $# -gt 0 ]]; then
-        case "$1" in
-            --install)
-                do_install "$@"
-                exit 0
-                ;;
-            --uninstall)
-                do_uninstall
-                exit 0
-                ;;
-            --foreground)
-                FOREGROUND=1
-                shift
-                ;;
-            *)
-                echo "Usage:"
-                echo "  $0 --install --url <URL> --token <TOKEN>"
-                echo "  $0 --uninstall"
-                echo "  $0 --foreground (for debugging)"
+    
+    case "$action" in
+        install)
+            if [[ -z "$install_url" ]] || [[ -z "$install_token" ]]; then
+                echo "Error: --install requires URL and TOKEN"
+                echo "Usage: $0 --install <URL> <TOKEN>"
                 exit 1
-                ;;
-        esac
-    fi
-
-    # ============================================================
-    # Interactive execution detection
-    # ============================================================
-    # If this is a terminal and we are not in foreground mode,
-    # spawn a background version and exit immediately.
-    if [[ -z "${FOREGROUND:-}" && -t 0 ]]; then
-        # Use nohup to detach completely
-        nohup bash "$0" --foreground </dev/null >/dev/null 2>&1 &
-        exit 0
-    fi
-
-    # ============================================================
-    # Daemon mode (foreground or background)
-    # ============================================================
-
-    # Redirect stdout/stderr to log file (only after possible re‑exec)
-    exec >> "$LOG_FILE" 2>&1
-
-    log "=== Worker started (PID $$) ==="
-
-    # Check dependencies
-    check_deps
-
-    # Load config
-    load_config
-
-    # Acquire lock (exits if already running)
-    acquire_lock
-
-    # Start the main loop
-    run_forever
+            fi
+            install_worker "$install_url" "$install_token"
+            exit 0
+            ;;
+        uninstall)
+            uninstall_worker
+            exit 0
+            ;;
+        run)
+            # Normal execution: load config, acquire lock, run loop
+            load_config
+            
+            # Acquire lock – prevent multiple instances
+            if ! acquire_lock; then
+                log_error "Another instance is already running. Exiting."
+                exit 1
+            fi
+            
+            write_pid
+            log_info "Worker started (PID $$)"
+            log_info "Lock acquired, config loaded: SERVER_URL=$SERVER_URL"
+            
+            run_forever
+            ;;
+    esac
 }
+
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed."
+    echo "Install with: apt install jq (Debian/Ubuntu) or pkg install jq (Termux)"
+    exit 1
+fi
+
+# Check if curl is installed
+if ! command -v curl &> /dev/null; then
+    echo "Error: curl is required but not installed."
+    echo "Install with: apt install curl (Debian/Ubuntu) or pkg install curl (Termux)"
+    exit 1
+fi
 
 main "$@"
