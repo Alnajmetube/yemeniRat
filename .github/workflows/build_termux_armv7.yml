@@ -50,8 +50,6 @@ jobs:
                 zstd \
                 ccache
 
-              echo "Upgrading pip..."
-              python -m pip install --upgrade pip
 
               echo "Installing Python dependencies..."
               python -m pip install -r client_requirements.txt
