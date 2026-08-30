@@ -1,19 +1,21 @@
-name: Build x86_64 
+name: Build x86_64
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-20.04, ubuntu-22.04]  # بناء نسختين
+        os: [ubuntu-20.04, ubuntu-22.04]
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -52,9 +54,10 @@ jobs:
       #     path: build/worker_${{ matrix.os }}
 
       - name: Create GitHub Release
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Build ${{ github.run_number }}
+          tag_name: build-x86-${{ matrix.os }}-${{ github.run_number }}
+          name: Build x86_64 ${{ matrix.os }} ${{ github.run_number }}
           files: build/worker_${{ matrix.os }}
           generate_release_notes: true

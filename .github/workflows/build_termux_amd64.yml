@@ -34,7 +34,6 @@ jobs:
           set -e
 
           mkdir -p "${GITHUB_WORKSPACE}/build"
-
           sudo chmod -R 777 "${GITHUB_WORKSPACE}"
 
           docker run --rm \
@@ -58,7 +57,7 @@ jobs:
               fi
 
               echo "========================================"
-              echo "Fixing Termux package state"
+              echo "Updating Termux packages"
               echo "========================================"
 
               pkg update -y
@@ -97,7 +96,6 @@ jobs:
               echo "========================================"
 
               python -m pip install --upgrade Nuitka
-
               python -m nuitka --version
 
               echo "========================================"
@@ -187,10 +185,10 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }}
+          tag_name: build-termux-arm64-${{ github.run_number }}
+          name: Termux ARM64 Build ${{ github.run_number }}
           files: build/termux_client_arm64
           generate_release_notes: true

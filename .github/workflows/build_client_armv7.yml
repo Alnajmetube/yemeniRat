@@ -5,7 +5,6 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-
   workflow_dispatch:
 
 permissions:
@@ -57,9 +56,10 @@ jobs:
       #     if-no-files-found: error
 
       - name: Create GitHub Release
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Build ${{ github.run_number }}
+          tag_name: build-armv7-${{ github.run_number }}
+          name: Build ARMv7 ${{ github.run_number }}
           files: build/worker-armv7l
           generate_release_notes: true
