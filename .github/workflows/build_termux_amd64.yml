@@ -1,10 +1,13 @@
-name: Build Termux Standalone Binary
+name: Build Termux ARM64 Binary
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
 
   workflow_dispatch:
 
@@ -13,50 +16,181 @@ permissions:
 
 jobs:
   build-termux:
+    name: Build Termux ARM64
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up QEMU for ARM64 Emulation
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
-      - name: Build Standalone Binary inside Termux Environment
+      - name: Build ARM64 binary
+        shell: bash
         run: |
-          mkdir -p ${{ github.workspace }}/build
-          sudo chmod -R 777 ${{ github.workspace }}
+          set -e
 
-          docker run --rm -v ${{ github.workspace }}:/workspace termux/termux-docker:aarch64 bash -c "
-            pkg update -y && pkg upgrade -y
-            pkg install python clang build-essential patchelf zstd ccache termux-elf-cleaner ldd binutils -y
+          mkdir -p "${GITHUB_WORKSPACE}/build"
 
-            pip install -r /workspace/client_requirements.txt
-            pip install nuitka
+          sudo chmod -R 777 "${GITHUB_WORKSPACE}"
 
-            WORK_DIR=\$HOME/work
-            mkdir -p \$WORK_DIR
-            cp -r /workspace/* \$WORK_DIR/
-            cd \$WORK_DIR
+          docker run --rm \
+            --platform linux/arm64 \
+            --privileged \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            termux/termux-docker:aarch64 \
+            bash -c '
+              set -e
 
-            nuitka --standalone \
-                   --onefile \
-                   --lto=yes \
-                   --remove-output \
-                   --output-dir=build_out \
-                   --output-filename=termux_client_arm64 \
-                   client.py
+              echo "========================================"
+              echo "Termux ARM64 build environment"
+              echo "========================================"
 
-            strip build_out/termux_client_arm64
+              echo "Checking architecture..."
+              uname -m
 
-            cp build_out/termux_client_arm64 /workspace/build/
-          "
+              if [ "$(uname -m)" != "aarch64" ]; then
+                echo "ERROR: Container is not running as aarch64"
+                exit 1
+              fi
 
+              echo "========================================"
+              echo "Fixing Termux package state"
+              echo "========================================"
+
+              pkg update -y
+
+              echo "Installing build dependencies..."
+              pkg install -y \
+                python \
+                clang \
+                make \
+                binutils \
+                patchelf \
+                ccache \
+                ldd \
+                termux-elf-cleaner \
+                zstd
+
+              echo "========================================"
+              echo "Checking Python"
+              echo "========================================"
+
+              python --version
+              python -m pip --version
+
+              echo "========================================"
+              echo "Installing Python dependencies"
+              echo "========================================"
+
+              python -m pip install --upgrade pip
+
+              if [ -f /workspace/client_requirements.txt ]; then
+                python -m pip install -r /workspace/client_requirements.txt
+              fi
+
+              echo "========================================"
+              echo "Installing Nuitka"
+              echo "========================================"
+
+              python -m pip install --upgrade Nuitka
+
+              python -m nuitka --version
+
+              echo "========================================"
+              echo "Preparing source"
+              echo "========================================"
+
+              WORK_DIR="$HOME/work"
+
+              rm -rf "$WORK_DIR"
+              mkdir -p "$WORK_DIR"
+
+              cp -r /workspace/. "$WORK_DIR/"
+
+              cd "$WORK_DIR"
+
+              rm -rf build_out
+              mkdir -p build_out
+
+              echo "========================================"
+              echo "Building ARM64 binary"
+              echo "========================================"
+
+              python -m nuitka \
+                --mode=onefile \
+                --lto=yes \
+                --remove-output \
+                --output-dir=build_out \
+                --output-filename=termux_client_arm64 \
+                client.py
+
+              echo "========================================"
+              echo "Checking build result"
+              echo "========================================"
+
+              if [ ! -f "build_out/termux_client_arm64" ]; then
+                echo "ERROR: Binary was not created"
+                ls -lah build_out || true
+                exit 1
+              fi
+
+              chmod +x build_out/termux_client_arm64
+
+              echo "========================================"
+              echo "Cleaning binary"
+              echo "========================================"
+
+              strip build_out/termux_client_arm64 || true
+
+              if command -v termux-elf-cleaner >/dev/null 2>&1; then
+                termux-elf-cleaner build_out/termux_client_arm64 || true
+              fi
+
+              echo "========================================"
+              echo "Binary information"
+              echo "========================================"
+
+              file build_out/termux_client_arm64
+              ls -lh build_out/termux_client_arm64
+
+              echo "========================================"
+              echo "Copying binary"
+              echo "========================================"
+
+              cp build_out/termux_client_arm64 /workspace/build/
+
+              echo "BUILD SUCCESSFUL"
+            '
+
+      - name: Verify artifact
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -f "build/termux_client_arm64" ]; then
+            echo "ERROR: Build artifact does not exist"
+            exit 1
+          fi
+
+          file build/termux_client_arm64
+          ls -lh build/termux_client_arm64
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-client-arm64
+          path: build/termux_client_arm64
+          if-no-files-found: error
 
       - name: Create GitHub Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: build-${{ github.run_number }}
           name: Build ${{ github.run_number }}
           files: build/termux_client_arm64
           generate_release_notes: true
