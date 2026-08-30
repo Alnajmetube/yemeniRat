@@ -59,5 +59,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Build ${{ github.run_number }}
           files: build/worker-armv7l
           generate_release_notes: true

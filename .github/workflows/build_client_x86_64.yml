@@ -1,4 +1,4 @@
-name: Build Worker Binary
+name: Build x86_64 
 
 on:
   push:
@@ -54,5 +54,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Build ${{ github.run_number }}
           files: build/worker_${{ matrix.os }}
           generate_release_notes: true
