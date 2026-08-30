@@ -5,8 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
 
+
+  workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-22.04-arm  # ARM64 runner provided by GitHub
@@ -35,8 +38,14 @@ jobs:
         run: |
           nuitka --standalone --onefile --output-dir=build --output-filename=client client.py
 
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+      # - name: Upload binary artifact
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: client-arm64
+      #     path: build/client
+        
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: client-arm64
-          path: build/client
+          files: build/client-arm64
+          generate_release_notes: true

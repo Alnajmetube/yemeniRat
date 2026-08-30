@@ -1,0 +1,94 @@
+name: Build Termux ARMv7 Standalone Binary
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-termux-armv7:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARMv7
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build ARMv7 binary inside Termux container
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            termux/termux-docker:arm \
+            bash -c '
+              set -e
+
+              echo "Updating Termux packages..."
+              pkg update -y
+              pkg upgrade -y
+
+              echo "Installing build dependencies..."
+              pkg install -y \
+                python \
+                clang \
+                build-essential \
+                patchelf \
+                zstd \
+                ccache
+
+              echo "Upgrading pip..."
+              python -m pip install --upgrade pip
+
+              echo "Installing Python dependencies..."
+              python -m pip install -r client_requirements.txt
+
+              echo "Installing Nuitka..."
+              python -m pip install nuitka
+
+              echo "Building standalone binary..."
+              nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --remove-output \
+                --output-dir=build \
+                --output-filename=worker-armv7l \
+                client.py
+
+              echo "Stripping binary..."
+              strip build/worker-armv7l
+
+              echo "Build completed:"
+              ls -lh build/worker-armv7l
+              file build/worker-armv7l
+            '
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-armv7l-termux
+          path: build/worker-armv7l
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: build/worker-armv7l
+          generate_release_notes: true

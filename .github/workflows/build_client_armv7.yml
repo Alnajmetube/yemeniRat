@@ -5,7 +5,11 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-armv7:
@@ -45,9 +49,15 @@ jobs:
               strip build/worker-armv7l
             "
 
-      - name: رفع الملف الناتج
-        uses: actions/upload-artifact@v4
+      # - name: رفع الملف الناتج
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: worker-armv7l
+      #     path: build/worker-armv7l
+      #     if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: worker-armv7l
-          path: build/worker-armv7l
-          if-no-files-found: error
+          files: build/worker-armv7l
+          generate_release_notes: true
