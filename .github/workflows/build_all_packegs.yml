@@ -266,7 +266,8 @@ jobs:
     needs:
       - build-arm64
       - build-armv7
-      - build-worker
+      - build-ubuntu-20
+      - build-ubuntu-22
       - build-termux-arm64
       - build-termux-armv7
     runs-on: ubuntu-latest
