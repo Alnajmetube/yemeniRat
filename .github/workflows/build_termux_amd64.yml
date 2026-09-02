@@ -72,7 +72,8 @@ jobs:
                 ccache \
                 ldd \
                 termux-elf-cleaner \
-                zstd
+                zstd \
+                file
 
               echo "========================================"
               echo "Checking Python"

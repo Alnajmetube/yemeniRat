@@ -48,7 +48,8 @@ jobs:
                 build-essential \
                 patchelf \
                 zstd \
-                ccache
+                ccache \
+                file
 
 
               echo "Installing Python dependencies..."
